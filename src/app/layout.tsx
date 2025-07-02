@@ -1,4 +1,10 @@
 import "./globals.css";
+import Navigation from "@/components/Navigation";
+
+export const metadata = {
+  title: "Proposal Writing Assistant - RAG-Powered Proposal Generation",
+  description: "Generate structured proposals based on historical success patterns using AI-powered RAG technology.",
+};
 
 export default function RootLayout({
   children,
@@ -7,7 +13,10 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <Navigation />
+        {children}
+      </body>
     </html>
   );
 }
