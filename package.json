@@ -1,5 +1,5 @@
 {
-  "name": "proposal_agent",
+  "name": "template-2",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -19,6 +19,10 @@
     "firebase": "^10.13.0",
     "firebase-admin": "^13.4.0",
     "framer-motion": "^11.3.31",
+    "langchain": "^0.3.0",
+    "@langchain/core": "^0.3.0",
+    "@langchain/openai": "^0.3.0",
+    "@langchain/community": "^0.3.0",
     "lucide-react": "^0.436.0",
     "mammoth": "^1.9.1",
     "next": "14.2.7",

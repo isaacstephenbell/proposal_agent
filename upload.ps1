@@ -48,31 +48,21 @@ if (-not $FolderPath -or -not $ClientName) {
     exit 1
 }
 
-# Build the command arguments
-$args = @($FolderPath, $ClientName)
-
-if ($Date) {
-    $args += "--date", $Date
-}
-
-if ($Tags) {
-    $args += "--tags", $Tags
-}
+# Build the command arguments for LangChain upload
+$args = @($FolderPath)
 
 if ($Recursive) {
     $args += "--recursive"
 }
 
 if ($FileTypes) {
-    $args += "--file-types", $FileTypes
+    $args += "--file-types=$FileTypes"
 }
 
 # Display what we're about to do
-Write-Host "Starting bulk upload with the following parameters:" -ForegroundColor Green
+Write-Host "🚀 Starting LangChain-powered proposal upload..." -ForegroundColor Green
 Write-Host "  Folder: $FolderPath" -ForegroundColor Yellow
-Write-Host "  Client: $ClientName" -ForegroundColor Yellow
-if ($Date) { Write-Host "  Date: $Date" -ForegroundColor Yellow }
-if ($Tags) { Write-Host "  Tags: $Tags" -ForegroundColor Yellow }
+Write-Host "  Auto-extracting: Client, Author, Date, Sector, Tags" -ForegroundColor Yellow
 if ($Recursive) { Write-Host "  Recursive: Yes" -ForegroundColor Yellow }
 if ($FileTypes) { Write-Host "  File Types: $FileTypes" -ForegroundColor Yellow }
 Write-Host ""
@@ -86,10 +76,10 @@ if (-not (Test-Path $FolderPath)) {
     exit 1
 }
 
-# Run the bulk upload tool
+# Run the LangChain upload tool
 try {
-    Write-Host "🚀 Starting enhanced bulk proposal upload..." -ForegroundColor Green
-    npx tsx bulk-upload.ts @args
+    Write-Host "🔗 Using LangChain pipeline with enhanced metadata extraction..." -ForegroundColor Green
+    npx tsx src/lib/langchain-upload.ts @args
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host ""

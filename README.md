@@ -38,7 +38,7 @@ A Retrieval-Augmented Generation (RAG) powered proposal writing assistant that g
 
 ```bash
 git clone <your-repo>
-cd proposal_agent
+cd template-2
 npm install
 ```
 
