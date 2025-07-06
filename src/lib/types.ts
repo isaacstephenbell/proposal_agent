@@ -171,4 +171,50 @@ export interface ThoughtPartnerState {
   currentStep: number;
   brief: Partial<ProposalBrief>;
   isComplete: boolean;
+}
+
+// Proposal Blocks types
+export interface ProposalBlock {
+  id: string;
+  title: string;
+  content: string;
+  tags: string[];
+  author_id: string;
+  created_at: string;
+  last_used_at: string;
+  usage_count: number;
+  notes?: string;
+  similarity?: number;
+}
+
+export interface CreateBlockRequest {
+  title: string;
+  content: string;
+  tags?: string[];
+  author_id: string;
+  notes?: string;
+}
+
+export interface UpdateBlockRequest {
+  title?: string;
+  content?: string;
+  tags?: string[];
+  notes?: string;
+}
+
+export interface BlockSearchRequest {
+  query?: string;
+  tags?: string[];
+  author_id?: string;
+  limit?: number;
+  sort?: 'recent' | 'popular' | 'last_used';
+}
+
+export interface BlockSuggestionRequest {
+  context: string; // The current proposal context
+  client?: string;
+  sector?: string;
+  tags?: string[];
+  excludeBlockIds?: string[];
+  limit?: number;
 } 

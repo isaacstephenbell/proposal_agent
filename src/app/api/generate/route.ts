@@ -1,63 +1,52 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createProposalPipeline } from '@/lib/langchain-pipeline';
-import { generateProposal } from '@/lib/openai';
-import { GenerateRequest, GeneratedProposal } from '@/lib/types';
+import { OpenAI } from 'openai';
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 export async function POST(request: NextRequest) {
   try {
-    const { problem, client, filters }: GenerateRequest & { filters?: any } = await request.json();
+    const { brief, currentContent, prompt } = await request.json();
 
-    if (!problem) {
-      return NextResponse.json(
-        { error: 'Problem statement is required' },
-        { status: 400 }
-      );
-    }
+    // Build context for AI generation
+    let contextPrompt = `You are a professional proposal writer helping to create high-quality business proposals. 
 
-    // Create pipeline instance
-    const pipeline = createProposalPipeline();
+Current proposal context:
+- Goals: ${brief?.goals?.join(', ') || 'Not specified'}
+- Audience: ${brief?.audience?.join(', ') || 'Not specified'}
+- Constraints: ${brief?.constraints || 'Not specified'}
 
-    // Use LangChain pipeline for retrieval
-    const retrievalResult = await pipeline.queryDocuments(problem, filters);
+Current content excerpt:
+${currentContent ? currentContent.slice(-500) : 'No content yet'}
 
-    if (!retrievalResult.success) {
-      return NextResponse.json(
-        { error: 'Failed to retrieve similar proposals', details: retrievalResult.errors },
-        { status: 500 }
-      );
-    }
+User request: ${prompt}
 
-    if (retrievalResult.results.length === 0) {
-      return NextResponse.json({
-        proposal: "I don't have enough historical data to generate a proposal for this problem. Please add some historical proposals first.",
-        sources: []
-      });
-    }
+Please provide helpful, professional content that fits the context and maintains consistency with the existing proposal. Be concise and actionable.`;
 
-    // Generate new proposal based on historical context
-    const proposal = await generateProposal(problem, retrievalResult.results, client);
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4',
+      messages: [
+        {
+          role: 'system',
+          content: contextPrompt
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      max_tokens: 1000,
+      temperature: 0.7,
+    });
 
-    // Format sources for response
-    const sources = retrievalResult.results.map(chunk => ({
-      client: chunk.metadata?.client || chunk.client,
-      filename: chunk.metadata?.filename || chunk.filename,
-      content: chunk.content,
-      author: chunk.metadata?.author || chunk.author,
-      sector: chunk.metadata?.sector || chunk.sector,
-      tags: chunk.metadata?.tags || chunk.tags,
-      similarity: chunk.similarity
-    }));
+    const content = completion.choices[0].message.content;
 
-    const response: GeneratedProposal = {
-      proposal,
-      sources
-    };
-
-    return NextResponse.json(response);
+    return NextResponse.json({ content });
   } catch (error) {
-    console.error('Error in generate API:', error);
+    console.error('Error generating content:', error);
     return NextResponse.json(
-      { error: 'Failed to generate proposal', details: error instanceof Error ? error.message : 'Unknown error' },
+      { error: 'Failed to generate content' },
       { status: 500 }
     );
   }

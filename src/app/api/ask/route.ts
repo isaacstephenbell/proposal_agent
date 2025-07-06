@@ -135,17 +135,44 @@ function generateSnippet(content: string, query: string): string {
 }
 
 function detectAmbiguity(query: string): { isAmbiguous: boolean; clarification?: string } {
-  // Check for common ambiguous terms
+  const queryLower = query.toLowerCase();
+  
+  // Check for common ambiguous terms, but exclude cases where clarification is already provided
   const ambiguousTerms = [
-    { term: 'OEM', clarification: 'Do you mean work for OEM clients, or work related to OEM parts/vendors?' },
-    { term: 'consulting', clarification: 'Are you looking for internal consulting work or external client consulting?' },
-    { term: 'management', clarification: 'Do you mean project management, change management, or executive management?' },
-    { term: 'development', clarification: 'Are you looking for business development, software development, or talent development?' }
+    { 
+      term: 'OEM', 
+      clarification: 'Do you mean work for OEM clients, or work related to OEM parts/vendors?',
+      clarifiedTerms: ['oem clients', 'oem parts', 'oem vendors'] 
+    },
+    { 
+      term: 'consulting', 
+      clarification: 'Are you looking for internal consulting work or external client consulting?',
+      clarifiedTerms: ['internal consulting', 'external consulting', 'client consulting'] 
+    },
+    { 
+      term: 'management', 
+      clarification: 'Do you mean project management, change management, or executive management?',
+      clarifiedTerms: ['project management', 'change management', 'executive management'] 
+    },
+    { 
+      term: 'development', 
+      clarification: 'Are you looking for business development, software development, or talent development?',
+      clarifiedTerms: ['business development', 'software development', 'talent development'] 
+    }
   ];
   
-  for (const { term, clarification } of ambiguousTerms) {
-    if (query.toLowerCase().includes(term.toLowerCase())) {
-      return { isAmbiguous: true, clarification };
+  for (const { term, clarification, clarifiedTerms } of ambiguousTerms) {
+    // Check if the ambiguous term exists in the query
+    if (queryLower.includes(term.toLowerCase())) {
+      // Check if any clarified terms are already present
+      const isAlreadyClarified = clarifiedTerms.some(clarifiedTerm => 
+        queryLower.includes(clarifiedTerm.toLowerCase())
+      );
+      
+      // Only return ambiguous if clarification hasn't been provided
+      if (!isAlreadyClarified) {
+        return { isAmbiguous: true, clarification };
+      }
     }
   }
   
