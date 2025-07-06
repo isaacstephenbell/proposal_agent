@@ -63,6 +63,9 @@ export interface ChatMessage {
     client: string;
     filename: string;
     content: string;
+    date?: string;
+    author?: string;
+    sector?: string;
   }>;
 }
 
@@ -75,13 +78,58 @@ export interface GeneratedProposal {
   }>;
 }
 
+// Enhanced with context tracking
+export interface ConversationContext {
+  lastClient?: string;
+  lastSector?: string;
+  lastQuery?: string;
+}
+
+export interface AppliedFilters {
+  client?: string;
+  sector?: string;
+  author?: string;
+  dateRange?: string;
+  contextSource?: 'explicit' | 'followup' | 'none';
+  queryEnhancement?: string;
+}
+
+export interface DuplicateInfo {
+  filename: string;
+  similarity: number;
+  reason: string;
+}
+
+export interface CorrectionFeedback {
+  sourceId: string;
+  field: 'client' | 'author' | 'sector' | 'date';
+  oldValue: string;
+  newValue: string;
+  context: string;
+}
+
 export interface AskResponse {
   answer: string;
   sources: Array<{
     client: string;
     filename: string;
     content: string;
+    date?: string;
+    author?: string;
+    sector?: string;
+    snippet?: string;
+    confidence?: {
+      client: number;
+      author: number;
+      sector: number;
+      date: number;
+    };
+    duplicates?: DuplicateInfo[];
   }>;
+  context?: ConversationContext;
+  appliedFilters?: AppliedFilters;
+  suggestions?: string[];
+  duplicateWarnings?: DuplicateInfo[];
 }
 
 export interface GenerateRequest {
@@ -91,4 +139,36 @@ export interface GenerateRequest {
 
 export interface AskRequest {
   query: string;
+  context?: ConversationContext;
+}
+
+// Thought Partner types
+export interface ProposalBrief {
+  goals: string[];
+  customGoal?: string;
+  audience: string[];
+  customAudience?: string;
+  challenges: string;
+  references: Array<{
+    filename: string;
+    client: string;
+    relevance: string;
+  }>;
+  timeline?: string;
+  budget?: string;
+}
+
+export interface ThoughtPartnerStep {
+  step: number;
+  question: string;
+  type: 'multiple-choice' | 'text' | 'recommendations' | 'summary';
+  options?: string[];
+  allowCustom?: boolean;
+  allowMultiple?: boolean;
+}
+
+export interface ThoughtPartnerState {
+  currentStep: number;
+  brief: Partial<ProposalBrief>;
+  isComplete: boolean;
 } 

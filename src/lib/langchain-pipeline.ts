@@ -8,6 +8,7 @@ import { extractMetadataFromDocument, DocumentMetadata } from './extractMetadata
 import { chunkText } from './chunker';
 import { insertProposalChunk, searchSimilarProposals, supabaseAdmin } from './supabase';
 import { generateEmbedding } from './openai';
+import { checkForDuplicates, calculateFileHash, formatDuplicateWarning } from './duplicate-detector';
 
 // Configuration interface for the pipeline
 export interface PipelineConfig {
@@ -42,8 +43,8 @@ export async function ingestDocument(filePath: string): Promise<{
     // Determine file type and parse accordingly
     const content = await parseDocument(filePath);
     
-    // Generate file hash for deduplication
-    const fileHash = crypto.createHash('sha256').update(content).digest('hex');
+    // Generate file hash for deduplication using our duplicate detector
+    const fileHash = calculateFileHash(content);
     
     // Extract basic file metadata
     const fileName = filePath.split(/[/\\]/).pop() || 'unknown';
@@ -66,16 +67,22 @@ export async function ingestDocument(filePath: string): Promise<{
 
 async function parseDocument(filePath: string): Promise<string> {
   const fileExtension = filePath.toLowerCase().split('.').pop();
+  console.log(`  🔍 Parsing ${fileExtension?.toUpperCase()} file...`);
   
   switch (fileExtension) {
     case 'txt':
     case 'md':
+      console.log(`  📄 Reading text file...`);
       return readFileSync(filePath, 'utf-8');
     
     case 'docx':
       try {
+        console.log(`  📄 Reading DOCX file...`);
         const buffer = readFileSync(filePath);
+        console.log(`  📦 DOCX buffer size: ${buffer.length} bytes`);
+        console.log(`  🔄 Extracting text with Mammoth...`);
         const result = await mammoth.extractRawText({ buffer });
+        console.log(`  ✅ DOCX text extracted: ${result.value.length} characters`);
         return result.value;
       } catch (error) {
         throw new Error(`Failed to parse DOCX file: ${error}`);
@@ -83,10 +90,28 @@ async function parseDocument(filePath: string): Promise<string> {
     
     case 'pdf':
       try {
+        console.log(`  📄 Reading PDF file...`);
         const buffer = readFileSync(filePath);
-        const data = await pdf(buffer);
+        console.log(`  📦 PDF buffer size: ${buffer.length} bytes`);
+        console.log(`  🔄 Parsing PDF with pdf-parse...`);
+        
+        // Add timeout for PDF parsing
+        const parsePromise = pdf(buffer);
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('PDF parsing timeout after 30 seconds')), 30000)
+        );
+        
+        const data = await Promise.race([parsePromise, timeoutPromise]) as any;
+        console.log(`  ✅ PDF parsed successfully`);
+        console.log(`  📊 PDF info: ${data.numpages} pages, ${data.text.length} characters`);
+        
+        if (!data.text || data.text.trim().length === 0) {
+          throw new Error('PDF appears to be empty or contains no extractable text');
+        }
+        
         return data.text;
       } catch (error) {
+        console.error(`  ❌ PDF parsing error:`, error);
         throw new Error(`Failed to parse PDF file: ${error}`);
       }
     
@@ -223,21 +248,26 @@ export class ProposalPipeline {
       const ingestionResult = await ingestDocument(filePath);
       console.log(`  📖 Extracted text: ${ingestionResult.content.length} characters`);
       
-      // Step 2: Check for duplicates
-      const { data: existing, error: checkError } = await supabaseAdmin
-        .from('proposals')
-        .select('id')
-        .eq('file_hash', ingestionResult.fileHash)
-        .limit(1);
+      // Step 2: Check for duplicates with comprehensive detection
+      console.log(`  🔍 Checking for duplicates...`);
+      const duplicateCheck = await checkForDuplicates(
+        ingestionResult.metadata.fileName,
+        ingestionResult.content,
+        ingestionResult.fileHash
+      );
       
-      if (checkError) {
-        errors.push(`Error checking for duplicates: ${checkError.message}`);
-        return { success: false, chunksProcessed: 0, metadata: {} as DocumentMetadata, errors };
-      }
-      
-      if (existing && existing.length > 0) {
-        errors.push(`Duplicate detected (SHA-256: ${ingestionResult.fileHash}). Skipping.`);
-        return { success: false, chunksProcessed: 0, metadata: {} as DocumentMetadata, errors };
+      if (duplicateCheck.isDuplicate) {
+        const warning = formatDuplicateWarning(duplicateCheck);
+        console.log(`  ⚠️  ${warning}`);
+        
+        if (!duplicateCheck.shouldProceed) {
+          errors.push(`Duplicate detected: ${duplicateCheck.reason}. File: ${duplicateCheck.duplicateFile}`);
+          return { success: false, chunksProcessed: 0, metadata: {} as DocumentMetadata, errors };
+        } else {
+          errors.push(`Warning: ${duplicateCheck.reason}. File: ${duplicateCheck.duplicateFile}. Proceeding with upload.`);
+        }
+      } else {
+        console.log(`  ✅ No duplicates found, proceeding with upload`);
       }
       
       // Step 3: Extract metadata BEFORE chunking

@@ -90,6 +90,21 @@ class LangChainUploader {
     const files: string[] = [];
     const supportedTypes = this.options.fileTypes || ['txt', 'md', 'docx', 'pdf'];
 
+    // Check if the path is a file or directory
+    const stats = statSync(folderPath);
+    
+    if (stats.isFile()) {
+      // Handle single file
+      const extension = folderPath.toLowerCase().split('.').pop();
+      if (extension && supportedTypes.includes(extension)) {
+        files.push(folderPath);
+      } else {
+        console.error(`❌ Unsupported file type: ${extension}. Supported types: ${supportedTypes.join(', ')}`);
+      }
+      return files;
+    }
+
+    // Handle directory
     const processDirectory = (dirPath: string) => {
       try {
         const items = readdirSync(dirPath, { withFileTypes: true });
@@ -208,16 +223,17 @@ if (require.main === module) {
   
   if (args.length === 0) {
     console.log('🔗 LangChain-Powered Proposal Upload Tool');
-    console.log('Usage: tsx langchain-upload.ts <folder_path> [options]');
+    console.log('Usage: tsx langchain-upload.ts <folder_path_or_file_path> [options]');
     console.log('');
     console.log('Options:');
-    console.log('  --recursive          Process subdirectories recursively');
+    console.log('  --recursive          Process subdirectories recursively (folder mode only)');
     console.log('  --file-types=ext1,ext2   Comma-separated list of file extensions (default: txt,md,docx,pdf)');
     console.log('  --chunk-size=500     Chunk size in tokens (default: 500)');
     console.log('  --token-overlap=25   Token overlap between chunks (default: 25)');
     console.log('');
     console.log('Examples:');
     console.log('  tsx langchain-upload.ts ./proposals');
+    console.log('  tsx langchain-upload.ts ./proposal.pdf');
     console.log('  tsx langchain-upload.ts ./docs --recursive --file-types=pdf,docx');
     console.log('  tsx langchain-upload.ts ./proposals --chunk-size=600 --token-overlap=30');
     console.log('');
@@ -249,15 +265,15 @@ if (require.main === module) {
     }
   }
 
-  // Validate folder path
+  // Validate folder path or file path
   try {
     const stats = statSync(folderPath);
-    if (!stats.isDirectory()) {
-      console.error(`❌ Path is not a directory: ${folderPath}`);
+    if (!stats.isDirectory() && !stats.isFile()) {
+      console.error(`❌ Path is not a directory or file: ${folderPath}`);
       process.exit(1);
     }
   } catch (error) {
-    console.error(`❌ Folder not found: ${folderPath}`);
+    console.error(`❌ Path not found: ${folderPath}`);
     process.exit(1);
   }
 

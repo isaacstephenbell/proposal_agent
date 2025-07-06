@@ -66,10 +66,7 @@ export async function extractMetadataFromDocument(content: string): Promise<Docu
     // Extract date using enhanced regex patterns
     const date = extractProposalDate(content);
     
-    // Extract client information
-    const client = extractClient(content);
-    
-    // Use LLM for sector classification and tag generation
+    // Use LLM for sector classification, tag generation, AND client extraction
     const llmAnalysis = await analyzeWithLLM(content);
     
     return {
@@ -77,7 +74,7 @@ export async function extractMetadataFromDocument(content: string): Promise<Docu
       tags: llmAnalysis.tags,
       author,
       date,
-      client
+      client: llmAnalysis.client || extractClient(content) // Use LLM result, fallback to regex
     };
   } catch (error) {
     console.error('Error extracting metadata:', error);
@@ -368,18 +365,29 @@ function isValidClient(client: string): boolean {
     return false;
   }
   
-  // Exclude person names (common first names)
+  // Exclude person names (common first names) - EXPANDED LIST
   const personNames = [
     'james', 'alex', 'alexandra', 'alexander', 'michael', 'dan', 'daniel', 'douglas', 'doug',
     'george', 'rory', 'aaron', 'benjamin', 'jacob', 'miguel', 'jason', 'mike', 'jennica',
     'tyler', 'chris', 'andres', 'allison', 'sam', 'mahesh', 'nerissa', 'jaime', 'lisa',
-    'katie', 'stacy', 'halley', 'craig', 'ralph', 'josh', 'jack', 'trey', 'lara'
+    'katie', 'stacy', 'halley', 'craig', 'ralph', 'josh', 'jack', 'trey', 'lara',
+    'chantal', 'jorge', 'john', 'jane', 'robert', 'david', 'mary', 'patricia', 'jennifer',
+    'linda', 'elizabeth', 'barbara', 'susan', 'jessica', 'sarah', 'karen', 'nancy',
+    'betty', 'helen', 'sandra', 'donna', 'carol', 'ruth', 'sharon', 'michelle',
+    'laura', 'emily', 'kimberly', 'deborah', 'dorothy', 'lisa', 'amy', 'angela',
+    'brenda', 'emma', 'marie', 'alice', 'jean', 'shirley', 'diane', 'julie',
+    'joyce', 'victoria', 'kelly', 'christina', 'joan', 'evelyn', 'lauren', 'judith',
+    'megan', 'cheryl', 'martha', 'andrea', 'frances', 'hannah', 'jacqueline', 'gloria',
+    'teresa', 'kathryn', 'sara', 'janice', 'julia', 'marie', 'madison', 'grace',
+    'judy', 'theresa', 'beverly', 'denise', 'marilyn', 'amber', 'danielle', 'abigail'
   ];
   
-  for (const name of personNames) {
-    if (clientLower === name || clientLower.startsWith(name + ' ')) {
-      return false;
-    }
+  // Check if the entire client name is just a person's name
+  const clientWords = client.split(/\s+/);
+  if (clientWords.length <= 2 && clientWords.every(word => 
+    personNames.includes(word.toLowerCase())
+  )) {
+    return false;
   }
   
   // Exclude common false positives
@@ -419,7 +427,7 @@ function isValidClient(client: string): boolean {
   return true;
 }
 
-async function analyzeWithLLM(content: string): Promise<{ sector: string; tags: string[] }> {
+async function analyzeWithLLM(content: string): Promise<{ sector: string; tags: string[]; client?: string }> {
   try {
     // Take first 4000 characters for analysis
     const contentPreview = content.substring(0, 4000);
@@ -440,8 +448,19 @@ async function analyzeWithLLM(content: string): Promise<{ sector: string; tags: 
 
 2. TAGS: Generate up to 8 high-quality metadata tags that describe the proposal's key topics, keywords, and subjects. Focus on nouns and adjectives only. Tags should be specific and relevant to the proposal content.
 
-Guidelines:
-- Use lowercase, kebab-case format
+3. CLIENT: Extract the client COMPANY name from the proposal content. This should be the organization/company that the proposal is prepared for, NOT individual contact names.
+
+Guidelines for Client Extraction:
+- Look for patterns like "Proposal for [Company]", "Prepared for [Company]", "Submitted to [Company]"
+- Identify company names (often have suffixes like Inc, LLC, Group, Corporation, etc.)
+- If you see both a company name and individual names, choose the COMPANY
+- Common pattern: The proposal is FOR a company, with individual names as contacts
+- If you see "MGT" or similar abbreviations in context of being the client, that's likely the company
+- DO NOT return individual person names as the client
+- If no clear company name is found, return null
+
+Guidelines for Other Fields:
+- Use lowercase, kebab-case format for tags
 - Focus on business functions, methodologies, industries, and project types
 - Avoid generic terms like "business" or "project"
 - Deduplicate similar tags
@@ -449,7 +468,8 @@ Guidelines:
 Return your response in this exact JSON format:
 {
   "sector": "sector-name",
-  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7", "tag8"]
+  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7", "tag8"],
+  "client": "company-name-or-null"
 }`
         },
         {
@@ -463,7 +483,7 @@ Return your response in this exact JSON format:
 
     const responseText = response.choices[0]?.message?.content?.trim();
     if (!responseText) {
-      return { sector: 'other', tags: [] };
+      return { sector: 'other', tags: [], client: undefined };
     }
 
     try {
@@ -480,13 +500,13 @@ Return your response in this exact JSON format:
             .slice(0, 8) // Limit to 8 tags
         : [];
 
-      return { sector, tags };
+      return { sector, tags, client: analysis.client };
     } catch (parseError) {
       console.error('Error parsing LLM response:', parseError);
-      return { sector: 'other', tags: [] };
+      return { sector: 'other', tags: [], client: undefined };
     }
   } catch (error) {
     console.error('Error in LLM analysis:', error);
-    return { sector: 'other', tags: [] };
+    return { sector: 'other', tags: [], client: undefined };
   }
 } 
