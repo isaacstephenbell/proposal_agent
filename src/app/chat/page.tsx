@@ -28,6 +28,114 @@ interface ChatMessage {
   suggestions?: string[];
 }
 
+// Function to format message content with proper structure
+function formatMessageContent(content: string) {
+  // Split content into lines for processing
+  const lines = content.split('\n');
+  const formattedElements: JSX.Element[] = [];
+  let currentList: JSX.Element[] = [];
+  let listType: 'numbered' | 'bullet' | null = null;
+  let currentParagraph: string[] = [];
+
+  const finishCurrentList = () => {
+    if (currentList.length > 0) {
+      if (listType === 'numbered') {
+        formattedElements.push(
+          <ol key={formattedElements.length} className="list-decimal list-inside space-y-3 my-4 ml-6 bg-gray-50 p-4 rounded-lg">
+            {currentList}
+          </ol>
+        );
+      } else if (listType === 'bullet') {
+        formattedElements.push(
+          <ul key={formattedElements.length} className="list-disc list-inside space-y-3 my-4 ml-6 bg-blue-50 p-4 rounded-lg">
+            {currentList}
+          </ul>
+        );
+      }
+      currentList = [];
+      listType = null;
+    }
+  };
+
+  const finishCurrentParagraph = () => {
+    if (currentParagraph.length > 0) {
+      const paragraphText = currentParagraph.join(' ').trim();
+      if (paragraphText) {
+        formattedElements.push(
+          <p key={formattedElements.length} className="mb-4 leading-relaxed">
+            {formatInlineText(paragraphText)}
+          </p>
+        );
+      }
+      currentParagraph = [];
+    }
+  };
+
+  lines.forEach((line) => {
+    const trimmedLine = line.trim();
+    
+    // Skip empty lines
+    if (!trimmedLine) {
+      finishCurrentList();
+      finishCurrentParagraph();
+      return;
+    }
+
+    // Check for numbered list items (1. 2. 3.)
+    const numberedMatch = trimmedLine.match(/^(\d+)\.\s(.+)/);
+    if (numberedMatch) {
+      finishCurrentParagraph();
+      if (listType !== 'numbered') {
+        finishCurrentList();
+        listType = 'numbered';
+      }
+      currentList.push(
+        <li key={currentList.length} className="text-sm leading-relaxed py-1 pl-2">
+          {formatInlineText(numberedMatch[2])}
+        </li>
+      );
+      return;
+    }
+
+    // Check for bullet points (• or -)
+    const bulletMatch = trimmedLine.match(/^[•\-]\s(.+)/);
+    if (bulletMatch) {
+      finishCurrentParagraph();
+      if (listType !== 'bullet') {
+        finishCurrentList();
+        listType = 'bullet';
+      }
+      currentList.push(
+        <li key={currentList.length} className="text-sm leading-relaxed py-1 pl-2">
+          {formatInlineText(bulletMatch[1])}
+        </li>
+      );
+      return;
+    }
+
+    // Regular paragraph text
+    finishCurrentList();
+    currentParagraph.push(trimmedLine);
+  });
+
+  // Finish any remaining content
+  finishCurrentList();
+  finishCurrentParagraph();
+
+  return formattedElements.length > 0 ? formattedElements : [<p key={0}>{formatInlineText(content)}</p>];
+}
+
+// Function to format inline text (bold, etc.)
+function formatInlineText(text: string): JSX.Element[] {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={index} className="font-semibold">{part.slice(2, -2)}</strong>;
+    }
+    return <span key={index}>{part}</span>;
+  });
+}
+
 export default function DiscoveryChat() {
   const router = useRouter();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -46,11 +154,19 @@ export default function DiscoveryChat() {
 
   const exampleQuestions = [
     "What work have we done for MGT?",
-    "Show me our PowerParts projects in order by date",
+    "Show me our PowerParts projects in chronological order",
     "What consulting work have we done in the private equity sector?",
-    "When did we help with workforce planning?",
-    "What talent development solutions have we provided?",
-    "Tell me about our social impact projects",
+    "Give me a brief summary of our workforce planning projects",
+    "What talent development solutions have we provided in detailed format?",
+    "Tell me about our social impact projects using bullet points",
+  ];
+
+  const formatOptions = [
+    { label: "Default", description: "Problem → Solution format" },
+    { label: "Brief", description: "Concise summaries" },
+    { label: "Detailed", description: "Comprehensive information" },
+    { label: "Chronological", description: "Ordered by date" },
+    { label: "Bullet Points", description: "All bullet format" },
   ];
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -137,6 +253,16 @@ export default function DiscoveryChat() {
         </div>
 
         <div className="p-4 flex-1">
+          <h3 className="font-medium text-gray-900 mb-3">Format Options</h3>
+          <div className="space-y-1 mb-4">
+            {formatOptions.map((option, index) => (
+              <div key={index} className="text-xs text-gray-600 flex justify-between">
+                <span className="font-medium">{option.label}:</span>
+                <span>{option.description}</span>
+              </div>
+            ))}
+          </div>
+          
           <h3 className="font-medium text-gray-900 mb-3">Example Questions</h3>
           <div className="space-y-2">
             {exampleQuestions.map((question, index) => (
@@ -232,7 +358,7 @@ export default function DiscoveryChat() {
                   )}
 
                   <div className="text-sm mb-2">
-                    {message.content}
+                    {message.role === 'assistant' ? formatMessageContent(message.content) : message.content}
                   </div>
                   
                   {message.sources && message.sources.length > 0 && (

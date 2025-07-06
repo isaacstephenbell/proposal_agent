@@ -83,6 +83,12 @@ export interface ConversationContext {
   lastClient?: string;
   lastSector?: string;
   lastQuery?: string;
+  lastSuccessfulResults?: Array<{
+    id: string;
+    filename: string;
+    client: string;
+    content: string;
+  }>;
 }
 
 export interface AppliedFilters {
@@ -90,7 +96,7 @@ export interface AppliedFilters {
   sector?: string;
   author?: string;
   dateRange?: string;
-  contextSource?: 'explicit' | 'followup' | 'none';
+  contextSource?: 'explicit' | 'followup' | 'topic-followup' | 'none';
   queryEnhancement?: string;
 }
 
