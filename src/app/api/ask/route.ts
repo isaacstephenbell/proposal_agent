@@ -241,6 +241,27 @@ function extractClientFromQuery(query: string): string | null {
   return null;
 }
 
+function hasSemanticTopicShift(currentQuery: string, previousQuery: string): boolean {
+  // Simple semantic shift detection based on keyword overlap
+  const getCurrentKeyWords = (query: string) => {
+    return query.toLowerCase()
+      .replace(/\b(what|how|when|where|which|who|why|give|me|show|tell|about|work|projects|proposals|consulting|have|we|did|for|our|your|approach|methodology|is|are|the|and|or|in|on|at|with|can|you|do|does|been|will|should|could|would|typically|usually|normally|handle|conduct|structure)\b/g, '')
+      .split(/\s+/)
+      .filter(word => word.length > 3)
+      .slice(0, 5); // Get top 5 meaningful words
+  };
+  
+  const currentKeywords = getCurrentKeyWords(currentQuery);
+  const previousKeywords = getCurrentKeyWords(previousQuery);
+  
+  // Calculate word overlap
+  const commonWords = currentKeywords.filter(word => previousKeywords.includes(word));
+  const overlapRatio = commonWords.length / Math.max(currentKeywords.length, previousKeywords.length);
+  
+  // If less than 20% overlap, it's likely a topic shift
+  return overlapRatio < 0.2;
+}
+
 function isFollowUpQuery(query: string, context?: any): boolean {
   const queryLower = query.toLowerCase().trim();
   
@@ -254,12 +275,16 @@ function isFollowUpQuery(query: string, context?: any): boolean {
   // If we have context (lastClient, lastQuery, or lastSuccessfulResults) and the query doesn't start a new topic, treat as follow-up
   const hasContext = context && (context.lastClient || context.lastQuery || context.lastSuccessfulResults);
   
-  // More nuanced new topic detection - only flag as new topic if it's clearly starting fresh
+  // Enhanced new topic detection - recognize when switching to completely different domains
   const startsNewTopic = (
     // Direct questions about new clients/topics
     /^(what|how|when|where|which|who|why|give me|show me|tell me about)\s+(work|projects|proposals|consulting)\s+(have we|did we|for)\s/i.test(queryLower) ||
     // General methodology questions
-    /^(what|how)\s+(is|are)\s+(our|your)\s+(approach|methodology)/i.test(queryLower)
+    /^(what|how)\s+(is|are)\s+(our|your)\s+(approach|methodology)/i.test(queryLower) ||
+    // Sector/industry keywords that clearly indicate new topics
+    /\b(restaurants?|retail|healthcare|manufacturing|technology|education|finance|banking|insurance|government|nonprofit|energy|automotive|real estate|hospitality|construction|logistics|pharma|biotech|agriculture|media|entertainment|sports|travel|tourism|legal|advertising|marketing|private equity|venture capital|investment|asset management|hedge fund|pension|endowment|foundation|charity|NGO|startup|supply chain|procurement|HR|recruiting|training|leadership|governance|compliance|risk|audit|tax|accounting|data|analytics|AI|machine learning|blockchain|crypto|cloud|cybersecurity|digital|mobile|app|platform|marketplace|network|infrastructure|branding|content|research|market research|due diligence|valuation|sales|business development|pricing|campaign|social impact|environmental|climate|sustainability|ESG|carbon|renewable|solar|wind|fintech|saas|software|hardware|telecommunications|aerospace|defense|mining|oil|gas|ecommerce|B2B|B2C|enterprise|global|international|domestic|regional)\b/i.test(queryLower) ||
+    // Semantic relatedness check - if we have previous context, check if current query is related
+    (context?.lastQuery && hasSemanticTopicShift(queryLower, context.lastQuery))
   ) && !/(more|additional|else|other|similar|about|recent|latest)/i.test(queryLower);
   
   if (hasContext && !startsNewTopic) {
