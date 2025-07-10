@@ -29,10 +29,10 @@ export async function searchSimilarProposals(
   }
 ): Promise<ProposalChunk[]> {
   try {
-    const { data, error } = await supabaseAdmin
-      .rpc('match_proposals', {
+          const { data, error } = await supabaseAdmin
+        .rpc('match_proposals', {
         query_embedding: embedding,
-        match_threshold: 0.3,
+        match_threshold: 0.2, // Lowered from 0.3 to 0.2 for more permissive matching
         match_count: limit,
         filter_author: filters?.author || null,
         filter_sector: filters?.sector || null,
@@ -65,27 +65,35 @@ export async function hybridSearchProposals(
   }
 ): Promise<ProposalChunk[]> {
   try {
-    // First try semantic search
+    console.log(`🔍 HYBRID SEARCH for query: "${query}"`);
+    console.log(`📊 Filters applied:`, filters);
+    
+    // First try semantic search with lower threshold for better results
+    console.log(`🧠 Trying semantic search...`);
     const semanticResults = await searchSimilarProposals(embedding, limit, filters);
+    console.log(`🧠 Semantic search found ${semanticResults.length} results`);
     
     // If semantic search returns results, use them
     if (semanticResults.length > 0) {
+      console.log(`✅ Using semantic search results`);
       return semanticResults;
     }
     
     // If no semantic results, try exact text search for specific terms
-    console.log('Semantic search returned no results, trying text search for:', query);
+    console.log('⚠️ Semantic search returned no results, trying text search for:', query);
     
     // Extract potential exact match terms from query
     const exactTerms = extractExactTerms(query);
     
     if (exactTerms.length > 0) {
-      console.log('Searching for exact terms:', exactTerms);
+      console.log('🔤 Searching for exact terms:', exactTerms);
       
       // Build text search query
       const textSearchConditions = exactTerms.map(term => 
         `content.ilike.%${term}%`
       ).join(',');
+      
+      console.log('🔤 Text search conditions:', textSearchConditions);
       
       let textQuery = supabaseAdmin
         .from('proposals')
@@ -95,15 +103,19 @@ export async function hybridSearchProposals(
       // Apply filters if provided
       if (filters?.author) {
         textQuery = textQuery.eq('author', filters.author);
+        console.log('🔤 Applied author filter:', filters.author);
       }
       if (filters?.sector) {
         textQuery = textQuery.eq('sector', filters.sector);
+        console.log('🔤 Applied sector filter:', filters.sector);
       }
       if (filters?.client) {
         textQuery = textQuery.eq('client', filters.client);
+        console.log('🔤 Applied client filter:', filters.client);
       }
       if (filters?.tags && filters.tags.length > 0) {
         textQuery = textQuery.overlaps('tags', filters.tags);
+        console.log('🔤 Applied tags filter:', filters.tags);
       }
       
       const { data: textResults, error: textError } = await textQuery
@@ -111,12 +123,17 @@ export async function hybridSearchProposals(
         .order('created_at', { ascending: false });
       
       if (textError) {
-        console.error('Error in text search:', textError);
+        console.error('❌ Error in text search:', textError);
         return [];
       }
       
-      console.log(`Text search found ${textResults?.length || 0} results`);
+      console.log(`🔤 Text search found ${textResults?.length || 0} results`);
+      if (textResults && textResults.length > 0) {
+        console.log('🔤 Text search result clients:', textResults.map(r => r.client).slice(0, 3));
+      }
       return textResults || [];
+    } else {
+      console.log('🔤 No exact terms found in query, returning empty results');
     }
     
     return [];
@@ -144,7 +161,47 @@ function extractExactTerms(query: string): string[] {
     /hipaa/i,
     /sox/i,
     /iso[\s-]?\d+/i,
-    /\b[A-Z]{2,}\b/g // Acronyms
+    /\b[A-Z]{2,}\b/g, // Acronyms
+    // Industry/sector terms that should be searched exactly
+    /restaurants?/i,
+    /retail/i,
+    /healthcare/i,
+    /manufacturing/i,
+    /technology/i,
+    /education/i,
+    /finance/i,
+    /banking/i,
+    /insurance/i,
+    /government/i,
+    /nonprofit/i,
+    /energy/i,
+    /automotive/i,
+    /real\s+estate/i,
+    /hospitality/i,
+    /construction/i,
+    /logistics/i,
+    /pharma/i,
+    /biotech/i,
+    /agriculture/i,
+    /media/i,
+    /entertainment/i,
+    /sports/i,
+    /travel/i,
+    /tourism/i,
+    /legal/i,
+    /consulting/i,
+    /advertising/i,
+    /marketing/i,
+    /private\s+equity/i,
+    /venture\s+capital/i,
+    /investment/i,
+    /asset\s+management/i,
+    /hedge\s+fund/i,
+    /pension/i,
+    /endowment/i,
+    /foundation/i,
+    /charity/i,
+    /startup/i
   ];
   
   for (const pattern of exactTermPatterns) {
