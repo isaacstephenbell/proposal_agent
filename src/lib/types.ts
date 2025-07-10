@@ -96,7 +96,7 @@ export interface AppliedFilters {
   sector?: string;
   author?: string;
   dateRange?: string;
-  contextSource?: 'explicit' | 'followup' | 'topic-followup' | 'none';
+  contextSource?: 'explicit' | 'followup' | 'topic-followup' | 'topic-continuation' | 'client-followup' | 'followup-no-context' | 'none';
   queryEnhancement?: string;
 }
 
@@ -136,6 +136,9 @@ export interface AskResponse {
   appliedFilters?: AppliedFilters;
   suggestions?: string[];
   duplicateWarnings?: DuplicateInfo[];
+  // For feedback system
+  chunk_ids?: string[];
+  query_type?: string;
 }
 
 export interface GenerateRequest {
@@ -223,4 +226,36 @@ export interface BlockSuggestionRequest {
   tags?: string[];
   excludeBlockIds?: string[];
   limit?: number;
-} 
+}
+
+// Discovery Chat Feedback System
+export interface DiscoveryFeedback {
+  id?: string;
+  question: string;
+  answer: string;
+  rating: 'good' | 'bad';
+  feedback_reason?: string; // Why was it good/bad?
+  chunk_ids: string[];
+  query_type?: string;
+  applied_filters?: AppliedFilters;
+  user_id?: string;
+  session_id?: string;
+  created_at?: string;
+}
+
+export interface FeedbackRequest {
+  question: string;
+  answer: string;
+  rating: 'good' | 'bad';
+  feedback_reason?: string; // Why was it good/bad?
+  chunk_ids: string[];
+  query_type?: string;
+  applied_filters?: AppliedFilters;
+  session_id?: string;
+}
+
+export interface FeedbackResponse {
+  success: boolean;
+  error?: string;
+  feedback_id?: string;
+}

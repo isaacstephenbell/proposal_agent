@@ -26,6 +26,11 @@ interface ChatMessage {
     queryEnhancement?: string;
   };
   suggestions?: string[];
+  // For feedback system
+  chunk_ids?: string[];
+  query_type?: string;
+  original_question?: string; // The user question that generated this response
+  feedback_given?: 'good' | 'bad' | null;
 }
 
 // Function to format message content with proper structure
@@ -142,6 +147,9 @@ export default function DiscoveryChat() {
   const [currentContext, setCurrentContext] = useState<any>({});
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [expandedSources, setExpandedSources] = useState<{[key: number]: boolean}>({});
+  const [feedbackModal, setFeedbackModal] = useState<{messageIndex: number, rating: 'good' | 'bad'} | null>(null);
+  const [feedbackReason, setFeedbackReason] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -197,7 +205,12 @@ export default function DiscoveryChat() {
           sources: data.sources,
           context: data.context,
           appliedFilters: data.appliedFilters,
-          suggestions: data.suggestions
+          suggestions: data.suggestions,
+          // For feedback system
+          chunk_ids: data.chunk_ids,
+          query_type: data.query_type,
+          original_question: userMessage,
+          feedback_given: null
         };
         
         setMessages(prev => [...prev, assistantMessage]);
@@ -226,9 +239,69 @@ export default function DiscoveryChat() {
     setInput(suggestion);
   };
 
-  const clearContext = () => {
-    setCurrentContext({});
+  const toggleSources = (messageIndex: number) => {
+    setExpandedSources(prev => ({
+      ...prev,
+      [messageIndex]: !prev[messageIndex]
+    }));
   };
+
+  const handleFeedback = async (messageIndex: number, rating: 'good' | 'bad') => {
+    // For "good" ratings, submit immediately
+    if (rating === 'good') {
+      await submitFeedback(messageIndex, rating);
+    } else {
+      // For "bad" ratings, show modal to capture reason
+      setFeedbackModal({ messageIndex, rating });
+    }
+  };
+
+  const submitFeedback = async (messageIndex: number, rating: 'good' | 'bad', reason?: string) => {
+    const message = messages[messageIndex];
+    if (message.role !== 'assistant' || message.chunk_ids === undefined || !message.original_question) {
+      console.error('Cannot submit feedback: missing required data');
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: message.original_question,
+          answer: message.content,
+          rating,
+          feedback_reason: reason,
+          chunk_ids: message.chunk_ids,
+          query_type: message.query_type,
+          applied_filters: message.appliedFilters,
+          session_id: 'anonymous' // TODO: Generate proper session ID
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        // Update message to show feedback was given
+        setMessages(prev => prev.map((msg, idx) => 
+          idx === messageIndex 
+            ? { ...msg, feedback_given: rating }
+            : msg
+        ));
+        console.log('✅ Feedback submitted successfully:', data.feedback_id);
+        
+        // Close modal and reset reason
+        setFeedbackModal(null);
+        setFeedbackReason('');
+      } else {
+        console.error('Failed to submit feedback:', data.error);
+      }
+    } catch (error) {
+      console.error('Error submitting feedback:', error);
+    }
+  };
+
+
 
   const startWriting = () => {
     router.push('/writer');
@@ -289,32 +362,11 @@ export default function DiscoveryChat() {
 
       {/* Main Chat Area */}
       <div className="flex-1 flex flex-col">
-        {/* Enhanced Header with Current Focus */}
+        {/* Header */}
         <div className="bg-white border-b border-gray-200 p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-lg font-semibold text-gray-900">Ask me anything about your proposal history</h2>
-              <p className="text-sm text-gray-600">I can help you find past work, understand what's been successful, and inform your new proposals.</p>
-            </div>
-            
-            {/* Current Focus Indicator */}
-            {currentContext.lastClient && (
-              <div className="flex items-center space-x-2">
-                <span className="text-sm text-gray-500">Current Focus:</span>
-                <span className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm font-medium">
-                  {currentContext.lastClient}
-                </span>
-                <button
-                  onClick={clearContext}
-                  className="text-gray-400 hover:text-gray-600"
-                  title="Clear focus"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-            )}
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">Ask me anything about your proposal history</h2>
+            <p className="text-sm text-gray-600">I can help you find past work, understand what's been successful, and inform your new proposals.</p>
           </div>
         </div>
 
@@ -363,11 +415,30 @@ export default function DiscoveryChat() {
                   
                   {message.sources && message.sources.length > 0 && (
                     <div className="mt-4 border-t border-gray-100 pt-3">
-                      <h4 className="text-sm font-medium text-gray-900 mb-2">
-                        Sources ({message.sources.length}):
-                      </h4>
-                      <div className="space-y-2">
-                        {message.sources.map((source, sourceIndex) => (
+                      <div className="flex items-center justify-between mb-2">
+                        <h4 className="text-sm font-medium text-gray-900">
+                          Sources ({message.sources.length})
+                        </h4>
+                        <button
+                          onClick={() => toggleSources(index)}
+                          className="flex items-center text-sm text-gray-600 hover:text-gray-800 transition-colors"
+                        >
+                          <span className="mr-1">
+                            {expandedSources[index] ? 'Hide' : 'Show'}
+                          </span>
+                          <svg 
+                            className={`w-4 h-4 transition-transform ${expandedSources[index] ? 'rotate-180' : ''}`}
+                            fill="none" 
+                            stroke="currentColor" 
+                            viewBox="0 0 24 24"
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                          </svg>
+                        </button>
+                      </div>
+                      {expandedSources[index] && (
+                        <div className="space-y-2">
+                          {message.sources.map((source, sourceIndex) => (
                           <div key={sourceIndex} className="bg-gray-50 rounded p-3">
                             <div className="flex items-center justify-between mb-2">
                               <div className="font-medium text-sm text-gray-900">
@@ -411,7 +482,8 @@ export default function DiscoveryChat() {
                             )}
                           </div>
                         ))}
-                      </div>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -434,6 +506,48 @@ export default function DiscoveryChat() {
                       </div>
                     </div>
                   )}
+
+                  {/* Feedback Buttons */}
+                  {message.role === 'assistant' && message.chunk_ids !== undefined && (
+                    <div className="mt-4 border-t border-gray-100 pt-3">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-sm font-medium text-gray-700">
+                          Was this helpful?
+                        </h4>
+                        {message.feedback_given ? (
+                          <div className="flex items-center space-x-2">
+                            <span className="text-sm text-gray-600">
+                              Thanks for your feedback!
+                            </span>
+                            <span className={`px-2 py-1 rounded text-xs font-medium ${
+                              message.feedback_given === 'good' 
+                                ? 'bg-green-100 text-green-800' 
+                                : 'bg-red-100 text-red-800'
+                            }`}>
+                              {message.feedback_given === 'good' ? '👍 Good' : '👎 Bad'}
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="flex space-x-2">
+                            <button
+                              onClick={() => handleFeedback(index, 'good')}
+                              className="flex items-center space-x-1 px-3 py-1 text-sm text-green-700 hover:text-green-800 hover:bg-green-50 rounded transition-colors"
+                            >
+                              <span>👍</span>
+                              <span>Good</span>
+                            </button>
+                            <button
+                              onClick={() => handleFeedback(index, 'bad')}
+                              className="flex items-center space-x-1 px-3 py-1 text-sm text-red-700 hover:text-red-800 hover:bg-red-50 rounded transition-colors"
+                            >
+                              <span>👎</span>
+                              <span>Bad</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
@@ -453,13 +567,8 @@ export default function DiscoveryChat() {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Input with context indicator */}
+        {/* Input */}
         <div className="bg-white border-t border-gray-200 p-4">
-          {currentContext.lastClient && (
-            <div className="mb-2 text-sm text-gray-600">
-              💬 Continuing conversation about <strong>{currentContext.lastClient}</strong>
-            </div>
-          )}
           <form onSubmit={handleSubmit} className="flex space-x-2">
             <input
               type="text"
@@ -479,6 +588,44 @@ export default function DiscoveryChat() {
           </form>
         </div>
       </div>
+
+      {/* Feedback Modal */}
+      {feedbackModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+            <h3 className="text-lg font-semibold text-gray-900 mb-4">
+              What could be improved?
+            </h3>
+            <p className="text-sm text-gray-600 mb-4">
+              Help us understand what went wrong so we can improve the system.
+            </p>
+            <textarea
+              value={feedbackReason}
+              onChange={(e) => setFeedbackReason(e.target.value)}
+              placeholder="e.g., Wrong results, missing information, poor formatting, misunderstood query..."
+              rows={4}
+              className="w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-red-500 resize-none"
+            />
+            <div className="flex justify-end space-x-3 mt-4">
+              <button
+                onClick={() => {
+                  setFeedbackModal(null);
+                  setFeedbackReason('');
+                }}
+                className="px-4 py-2 text-gray-600 hover:text-gray-800"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => submitFeedback(feedbackModal.messageIndex, feedbackModal.rating, feedbackReason.trim() || undefined)}
+                className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700"
+              >
+                Submit Feedback
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 } 

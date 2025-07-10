@@ -91,6 +91,11 @@ const consultantQueryPatterns: QueryPattern[] = [
       /how (do )?(we|you) typically/i,
       /how (do )?(we|you) usually/i,
       /how (do )?(we|you) normally/i,
+      /how (do )?(we|you) approach.+typically/i,
+      /how (do )?(we|you) approach.+usually/i,
+      /how (do )?(we|you) approach.+normally/i,
+      /tell me how (we|you) approach/i,
+      /can you tell me how (we|you) approach/i,
       /what is (our|your) (typical|usual|standard|normal) approach/i,
       /what is (our|your) methodology/i,
       /how (do|should) (we|you) approach/i,
@@ -105,7 +110,10 @@ const consultantQueryPatterns: QueryPattern[] = [
       /explain (our|your) methodology/i,
       /(our|your) typical approach/i,
       /(our|your) usual approach/i,
-      /(our|your) standard approach/i
+      /(our|your) standard approach/i,
+      /typically.+(how|approach|method)/i,
+      /usually.+(how|approach|method)/i,
+      /normally.+(how|approach|method)/i
     ]
   },
   {
@@ -524,6 +532,9 @@ ${commonRules}
 Answer as if preparing a reference document for proposal writers.`;
   }
 }
+
+// Export query type detection for use in other modules
+export { detectConsultantQueryType };
 
 // Answer questions about historical proposals using the consultant query framework
 export async function answerQuestion(

@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { searchSimilarProposals, hybridSearchProposals, supabaseAdmin } from '@/lib/supabase';
-import { generateEmbedding, answerQuestion } from '@/lib/openai';
+import { generateEmbedding, answerQuestion, detectConsultantQueryType } from '@/lib/openai';
 import { AskRequest, AskResponse, ConversationContext, AppliedFilters, DuplicateInfo } from '@/lib/types';
 import { promises as fs } from 'fs';
 import path from 'path';
 
-// Get ALL proposals for a specific client (comprehensive search)
+// Get ALL proposals for a specific client (comprehensive search with intelligent matching)
 async function getAllProposalsForClient(clientName: string): Promise<any[]> {
   try {
     const { data, error } = await supabaseAdmin
@@ -20,10 +20,10 @@ async function getAllProposalsForClient(clientName: string): Promise<any[]> {
 
     if (!data) return [];
 
-    // Filter by client using similarity matching
+    // Use intelligent client matching with multiple strategies
     const matchingProposals = data.filter(proposal => {
       const proposalClient = proposal.metadata?.client || proposal.client || '';
-      return areClientsSimilar(proposalClient, clientName, 0.85);
+      return isClientMatch(proposalClient, clientName);
     });
 
     console.log(`Found ${matchingProposals.length} total proposals for ${clientName}`);
@@ -34,6 +34,44 @@ async function getAllProposalsForClient(clientName: string): Promise<any[]> {
   }
 }
 
+// Intelligent client matching using multiple strategies
+// Generic word-overlap similarity for client matching
+function calculateWordOverlapSimilarity(name1: string, name2: string): number {
+  if (!name1 || !name2) return 0;
+  
+  // Normalize: lowercase, remove common words, split into words
+  const stopWords = new Set(['inc', 'corp', 'llc', 'ltd', 'company', 'group', 'consulting', 'partners']);
+  
+  const words1 = name1.toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(word => word.length > 1 && !stopWords.has(word));
+    
+  const words2 = name2.toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(word => word.length > 1 && !stopWords.has(word));
+  
+  if (words1.length === 0 || words2.length === 0) return 0;
+  
+  // Calculate overlap using Jaccard similarity
+  const set1 = new Set(words1);
+  const set2 = new Set(words2);
+  
+  const intersection = new Set(Array.from(set1).filter(x => set2.has(x)));
+  const union = new Set(Array.from(set1).concat(Array.from(set2)));
+  
+  return intersection.size / union.size;
+}
+
+// Simple client matching using word overlap
+function isClientMatch(storedClient: string, searchClient: string): boolean {
+  if (!storedClient || !searchClient) return false;
+  
+  // Use word overlap similarity with threshold 0.4
+  return calculateWordOverlapSimilarity(storedClient, searchClient) >= 0.4;
+}
+
 // Intelligent filtering for when client has many proposals
 function shouldRequestClarification(chunks: any[], query: string): boolean {
   if (chunks.length === 0) return false;
@@ -41,16 +79,33 @@ function shouldRequestClarification(chunks: any[], query: string): boolean {
   // Count unique proposals/files
   const uniqueProposals = new Set(chunks.map(chunk => chunk.metadata?.filename || chunk.filename));
   
-  // If more than 5 unique proposals and query is general, ask for clarification
-  const isGeneralQuery = !query.toLowerCase().includes('recent') && 
-                        !query.toLowerCase().includes('latest') &&
-                        !query.toLowerCase().includes('chronological') &&
-                        !query.toLowerCase().includes('specific') &&
-                        !query.toLowerCase().match(/\d{4}/) && // No year mentioned
-                        !query.toLowerCase().includes('project') && // Not asking about specific project
-                        uniqueProposals.size > 5;
+  // Only request clarification for very large result sets with vague queries
+  const isVagueQuery = !query.toLowerCase().includes('recent') && 
+                      !query.toLowerCase().includes('latest') &&
+                      !query.toLowerCase().includes('chronological') &&
+                      !query.toLowerCase().includes('specific') &&
+                      !query.toLowerCase().match(/\d{4}/) && // No year mentioned
+                      !query.toLowerCase().includes('project') && // Not asking about specific project
+                      !query.toLowerCase().includes('approach') &&
+                      !query.toLowerCase().includes('methodology') &&
+                      !query.toLowerCase().includes('timeline') &&
+                      !query.toLowerCase().includes('deliverable') &&
+                      !query.toLowerCase().includes('team') &&
+                      !query.toLowerCase().includes('outcome') &&
+                      !query.toLowerCase().includes('result');
   
-  return isGeneralQuery;
+  // More reasonable threshold - trigger for large result sets (8+ unique files OR 50+ chunks)
+  const hasTooManyResults = uniqueProposals.size >= 8 || chunks.length >= 50;
+  
+  // Check if query is extremely vague (less than 3 meaningful words)
+  const meaningfulWords = query.toLowerCase()
+    .replace(/[^\w\s]/g, '')
+    .split(/\s+/)
+    .filter(word => word.length > 3 && !['what', 'when', 'where', 'which', 'have', 'does', 'been', 'work', 'done'].includes(word));
+  
+  const isExtremelyVague = meaningfulWords.length < 3;
+  
+  return hasTooManyResults && isVagueQuery && isExtremelyVague;
 }
 
 // Generate clarifying questions for clients with many proposals
@@ -138,73 +193,111 @@ What would be most helpful?`;
 }
 
 function extractClientFromQuery(query: string): string | null {
-  // Look for explicit client mentions
+  // First check if this is a methodology/approach query - these should NOT have client filters
+  const isMethodologyQuery = /how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/i.test(query) ||
+                            /what is (our|your) (typical|usual|standard|normal) approach/i.test(query) ||
+                            /what is (our|your) methodology/i.test(query) ||
+                            /best practices/i.test(query) ||
+                            /how (do|should) (we|you) approach/i.test(query);
+  
+  if (isMethodologyQuery) {
+    return null; // Don't extract client for methodology queries
+  }
+  
+  // Look for explicit client mentions with specific patterns (more conservative)
+  // Only match known client names or clear organizational patterns
+  const knownClients = ['MGT', 'PowerParts', 'Crux', 'Chamber', 'Baton Rouge', 'STARC', 'Trive', 'R&R Partners', 'Texas Mutual', 'wear blue'];
+  
+  // Check for known clients first
+  for (const client of knownClients) {
+    if (new RegExp(`\\b${client}\\b`, 'i').test(query)) {
+      console.log('🔍 Known client found:', client);
+      return client;
+    }
+  }
+  
+  // More specific patterns that avoid common false positives
   const clientPatterns = [
-    /\b(MGT|PowerParts|Crux|Baton Rouge Youth Coalition|U\.S\. Chamber)/i,
-    /for ([\w\s]+?)(?:\s|$|,|\?)/i,
-    /about ([\w\s]+?)(?:\s|$|,|\?)/i
+    /\bfor ([A-Z][A-Za-z\s&\.]{3,20}(?:\s+(?:Inc|Corp|LLC|Ltd|Group|Company|Partners)\b)?)/i, // "for ClientName" with optional legal entity
+    /\b([A-Z]{2,}(?:\s+[A-Z]{2,})?)\b/, // All caps acronyms like MGT, IBM, etc. (NO case-insensitive flag to avoid false positives)
+    /\bwith ([A-Z][A-Za-z\s&\.]{3,20}(?:\s+(?:Inc|Corp|LLC|Ltd|Group|Company|Partners)\b)?)/i, // "with ClientName"
+    /\bat ([A-Z][A-Za-z\s&\.]{3,20}(?:\s+(?:Inc|Corp|LLC|Ltd|Group|Company|Partners)\b)?)/i // "at ClientName"
   ];
   
   for (const pattern of clientPatterns) {
     const match = query.match(pattern);
     if (match) {
       const client = match[1].trim();
-      // Map common variations
-      if (client.toLowerCase().includes('mgt')) return 'MGT';
-      if (client.toLowerCase().includes('powerparts')) return 'PowerParts Group';
-      if (client.toLowerCase().includes('crux')) return 'Crux Capital';
-      if (client.toLowerCase().includes('baton rouge')) return 'Baton Rouge Youth Coalition';
-      if (client.toLowerCase().includes('chamber')) return 'U.S. Chamber of Commerce Foundation';
-      return client;
+      // Exclude common false positives and industry terms
+      const excludeWords = ['You', 'The', 'This', 'That', 'Those', 'These', 'What', 'When', 'Where', 'How', 'Why', 'Have', 'Done', 'Work', 'Been', 'Will', 'Can', 'Should', 'Could', 'Would', 'Doing', 'Getting', 'Making', 'Taking', 'Going', 'Coming', 'Being', 'Having', 'About', 'Pricing', 'Studies', 'Tell', 'Show', 'Give', 'Find', 'Get', 'restaurants', 'healthcare', 'technology', 'manufacturing', 'retail', 'education', 'government', 'nonprofit', 'finance', 'banking'];
+      
+      if (client.length >= 3 && !excludeWords.some(word => word.toLowerCase() === client.toLowerCase())) {
+        console.log('🔍 Client extraction attempting:', client);
+        return client;
+      }
     }
   }
   
   return null;
 }
 
-function isFollowUpQuery(query: string): boolean {
+function isFollowUpQuery(query: string, context?: any): boolean {
   const queryLower = query.toLowerCase().trim();
   
-  // If query explicitly mentions a client name, it's NOT a follow-up (it's a new topic)
-  const clientMentions = [
-    /\b(mgt|powerparts|crux|baton rouge|chamber|texas mutual|r&r|starc|trive|wear blue)\b/i
-  ];
+  // If query has specific client names, it's likely a new topic
+  const hasExplicitClient = /\b(MGT|PowerParts|Crux|Chamber|Baton Rouge|STARC|Trive|R&R Partners|Texas Mutual|wear blue)\b/i.test(query);
   
-  if (clientMentions.some(pattern => pattern.test(queryLower))) {
+  if (hasExplicitClient) {
     return false;
   }
   
+  // If we have context (lastClient, lastQuery, or lastSuccessfulResults) and the query doesn't start a new topic, treat as follow-up
+  const hasContext = context && (context.lastClient || context.lastQuery || context.lastSuccessfulResults);
+  
+  // More nuanced new topic detection - only flag as new topic if it's clearly starting fresh
+  const startsNewTopic = (
+    // Direct questions about new clients/topics
+    /^(what|how|when|where|which|who|why|give me|show me|tell me about)\s+(work|projects|proposals|consulting)\s+(have we|did we|for)\s/i.test(queryLower) ||
+    // General methodology questions
+    /^(what|how)\s+(is|are)\s+(our|your)\s+(approach|methodology)/i.test(queryLower)
+  ) && !/(more|additional|else|other|similar|about|recent|latest)/i.test(queryLower);
+  
+  if (hasContext && !startsNewTopic) {
+    console.log('🔄 Treating as follow-up due to context and non-new-topic pattern');
+    return true;
+  }
+  
+  // Specific follow-up indicators
   const followUpIndicators = [
-    // Demonstrative pronouns (referring to previous results)
+    // Demonstrative pronouns
     /^(the|that|this|those|these)\s/i,
     
-    // Continuation phrases that don't start new topics
-    /(more|additional|other|similar)/i,
-    /(details?|information|specifics)/i,
+    // Continuation/expansion requests
+    /\b(more|additional|other|similar|else)\b/i,
+    /\b(details?|information|specifics)\b/i,
     
-    // Ordering/formatting requests (likely follow-ups)
-    /in order/i,
-    /by date/i,
-    /chronological/i,
+    // Ordering/formatting requests
+    /\b(in order|by date|chronological|sorted|organized)\b/i,
     
-    // Clear follow-up phrases
-    /^(any|anything)\s+(else|more|other)/i,
-    /^can you/i,
-    /^do we have/i,
-    /^did we/i,
-    /^have we/i,
+    // Follow-up question words
+    /^(any|anything|can you|do we|did we|have we)\b/i,
     
-    // Continuation words that suggest building on previous context
-    /^(also|additionally|furthermore|moreover)/i,
-    /^(and|but|however|although)/i,
+    // Continuation conjunctions
+    /^(also|additionally|furthermore|moreover|and|but|however|although)\b/i,
     
-    // Questions that build on context (without client names)
-    /^tell me more/i,
-    /^give me more/i,
-    /^show me more/i
+    // Short queries (often follow-ups) - but not questions that clearly start new topics
+    queryLower.length < 20 && !/^(what|how|when|where|which|who|why)\b/i.test(queryLower),
+    
+    // Questions about "them" or "it" (referring to previous results)
+    /\b(them|it|they)\b/i,
+    
+    // Ambiguity resolution responses (single word answers to clarification questions)
+    /^(external|internal|client|project management|change management|executive management|business development|software development|talent development|oem clients|oem parts|oem vendors)$/i
   ];
   
-  return followUpIndicators.some(pattern => pattern.test(queryLower));
+  return followUpIndicators.some(indicator => 
+    typeof indicator === 'boolean' ? indicator : indicator.test(queryLower)
+  );
 }
 
 function generateProactiveFollowups(query: string, context: ConversationContext, chunks: any[]): string[] {
@@ -308,11 +401,12 @@ function detectAmbiguity(query: string): { isAmbiguous: boolean; clarification?:
       clarification: 'Do you mean work for OEM clients, or work related to OEM parts/vendors?',
       clarifiedTerms: ['oem clients', 'oem parts', 'oem vendors'] 
     },
-    { 
-      term: 'consulting', 
-      clarification: 'Are you looking for internal consulting work or external client consulting?',
-      clarifiedTerms: ['internal consulting', 'external consulting', 'client consulting'] 
-    },
+    // REMOVED: consulting ambiguity - too aggressive and unhelpful
+    // { 
+    //   term: 'consulting', 
+    //   clarification: 'Are you looking for internal consulting work or external client consulting?',
+    //   clarifiedTerms: ['internal consulting', 'external consulting', 'client consulting'] 
+    // },
     { 
       term: 'management', 
       clarification: 'Do you mean project management, change management, or executive management?',
@@ -475,34 +569,9 @@ function extractFormatInstructions(query: string): string | undefined {
   return undefined;
 }
 
-// Normalize client names for consistent display
+// Simply return the client name as-is (no hardcoded mappings)
 function normalizeClientName(clientName: string | undefined): string {
   if (!clientName) return 'Unknown Client';
-  
-  // Client name normalization mapping
-  const clientMappings: { [key: string]: string } = {
-    'MGT': 'MGT Consulting',
-    'PowerParts': 'PowerParts Group',
-    'Crux': 'Crux Capital',
-    'Texas Mutual': 'Texas Mutual Insurance',
-    'R&R': 'R&R Partners',
-    'STARC': 'STARC Systems',
-    'Trive': 'Trive Capital'
-  };
-  
-  // Check for exact matches first
-  if (clientMappings[clientName]) {
-    return clientMappings[clientName];
-  }
-  
-  // Check for partial matches using similarity
-  for (const [stored, display] of Object.entries(clientMappings)) {
-    if (areClientsSimilar(clientName, stored, 0.85)) {
-      return display;
-    }
-  }
-  
-  // Return original if no normalization needed
   return clientName;
 }
 
@@ -595,8 +664,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    console.log('=== REQUEST DETAILS ===');
     console.log('Query:', query);
-    console.log('Context:', context);
+    console.log('Context received:', JSON.stringify(context, null, 2));
+    console.log('Context keys:', context ? Object.keys(context) : 'null');
+    console.log('Context type:', typeof context);
 
     // Check for ambiguity first
     const ambiguityCheck = detectAmbiguity(query);
@@ -605,7 +677,10 @@ export async function POST(request: NextRequest) {
         answer: `I need clarification: ${ambiguityCheck.clarification}`,
         sources: [],
         context: context || {},
-        appliedFilters: { contextSource: 'none' }
+        appliedFilters: { contextSource: 'none' },
+        // For feedback system - even clarification requests need feedback
+        chunk_ids: [], // Empty array but present so feedback buttons show
+        query_type: detectConsultantQueryType(query)
       });
     }
 
@@ -613,43 +688,100 @@ export async function POST(request: NextRequest) {
     let searchFilters: any = {};
     let enhancedQuery = query;
     
-    // Extract explicit client from current query
-    const explicitClient = extractClientFromQuery(query);
+    // Determine if this is a follow-up query FIRST
+    const isFollowUp = isFollowUpQuery(query, context);
+    console.log('🔄 Follow-up Detection for query "' + query + '":', isFollowUp);
+    console.log('📋 Context received:', JSON.stringify(context, null, 2));
     
-    // Determine if this is a follow-up query
-    const isFollowUp = isFollowUpQuery(query);
+    // Test the new patterns manually
+    const testPatterns = [
+      { name: 'Demonstrative pronouns', pattern: /^(the|that|this|those|these)\s/i },
+      { name: 'Continuation requests', pattern: /\b(more|additional|other|similar|else)\b/i },
+      { name: 'Details requests', pattern: /\b(details?|information|specifics)\b/i },
+      { name: 'Question starters', pattern: /^(any|anything|can you|do we|did we|have we|tell me|show me|give me)\b/i },
+      { name: 'Short queries', pattern: query.toLowerCase().length < 20 && !/^(what|how|when|where|which|who|why)\b/i.test(query.toLowerCase()) },
+      { name: 'Reference pronouns', pattern: /\b(them|it|they)\b/i }
+    ];
+    console.log('🔍 Pattern tests:');
+    testPatterns.forEach((test, i) => {
+      const result = typeof test.pattern === 'boolean' ? test.pattern : test.pattern.test(query);
+      console.log(`  ${test.name}: ${result}`);
+    });
+    
+    // Only extract explicit client if this is NOT a follow-up query
+    const explicitClient = isFollowUp ? null : extractClientFromQuery(query);
+    console.log('👤 Client Extraction (isFollowUp=' + isFollowUp + '):', explicitClient);
     
     // Track applied filters for explainability
     const appliedFilters: AppliedFilters = {
       contextSource: 'none'
     };
     
-    // Apply context-aware filtering
+    // Apply context-aware filtering (simplified and more robust)
     if (explicitClient) {
       // Explicit client mentioned - use it and update context
       searchFilters.client = explicitClient;
       appliedFilters.client = explicitClient;
       appliedFilters.contextSource = 'explicit';
       console.log('Explicit client detected:', explicitClient);
-    } else if (isFollowUp && context?.lastClient) {
-      // Follow-up query - maintain previous client context
-      searchFilters.client = context.lastClient;
-      appliedFilters.client = context.lastClient;
-      appliedFilters.contextSource = 'followup';
-      enhancedQuery = `${query} for ${context.lastClient}`;
-      appliedFilters.queryEnhancement = enhancedQuery;
-      console.log('Follow-up query, maintaining client context:', context.lastClient);
-    } else if (isFollowUp && context?.lastSuccessfulResults) {
-      // Follow-up query - maintain previous topic/document context
-      console.log('Follow-up query, maintaining topic context from previous results');
-      appliedFilters.contextSource = 'topic-followup';
+    } else if (isFollowUp) {
+      // Follow-up query - try multiple context sources
+      console.log('Follow-up query detected, applying context...');
       
-      // Use the same documents/chunks from the previous successful search
-      const previousResultIds = context.lastSuccessfulResults.map((r: any) => r.id);
-      console.log('Filtering to previous result IDs:', previousResultIds.slice(0, 5));
-      
-      // We'll filter the results later to match previous successful results
-      searchFilters.previousResultIds = previousResultIds;
+      if (context?.lastSuccessfulResults && context.lastSuccessfulResults.length > 0) {
+        // Use previous successful results
+        appliedFilters.contextSource = 'topic-followup';
+        const previousResultIds = context.lastSuccessfulResults.map((r: any) => r.id);
+        console.log('Using previous result IDs:', previousResultIds.slice(0, 5));
+        searchFilters.previousResultIds = previousResultIds;
+      } else if (context?.lastClient) {
+        // Use previous client context
+        appliedFilters.contextSource = 'client-followup';
+        searchFilters.client = context.lastClient;
+        console.log('Using previous client context:', context.lastClient);
+      } else if (context?.lastQuery) {
+        // Use previous query context
+        appliedFilters.contextSource = 'topic-continuation';
+        
+        // Special handling for ambiguity resolution responses
+        const isAmbiguityResolution = ['external', 'internal', 'client', 'project management', 'change management', 'executive management', 'business development', 'software development', 'talent development'].includes(query.toLowerCase().trim());
+        
+        if (isAmbiguityResolution) {
+          // For ambiguity resolution, combine the resolution with key terms from previous query
+          const previousKeyTerms = context.lastQuery.toLowerCase()
+            .replace(/how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/gi, '')
+            .replace(/what is (our|your) (typical|usual|standard|normal) approach/gi, '')
+            .replace(/\b(to|for|the|and|or|in|on|at|with|about|can|you|tell|me|consulting|work|have|done|we|you)\b/g, '')
+            .split(/\s+/)
+            .filter(term => term.length > 3 && !['what', 'when', 'where', 'which', 'have', 'does', 'been', 'will', 'can', 'should', 'could', 'would', 'typically', 'usually', 'approach', 'methodology'].includes(term))
+            .slice(0, 4); // Get more key terms for better context
+          
+          console.log('🔧 Ambiguity resolution detected. Previous key terms:', previousKeyTerms);
+          
+          // Combine resolution with previous context - prioritize the key terms
+          enhancedQuery = `${query} ${previousKeyTerms.join(' ')}`;
+          console.log('🔧 Enhanced query for ambiguity resolution:', enhancedQuery);
+        } else {
+          // Regular topic continuation
+          const previousKeyTerms = context.lastQuery.toLowerCase()
+            .replace(/how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/gi, '')
+            .replace(/what is (our|your) (typical|usual|standard|normal) approach/gi, '')
+            .replace(/\b(to|for|the|and|or|in|on|at|with|about|can|you|tell|me)\b/g, '')
+            .split(/\s+/)
+            .filter(term => term.length > 3 && !['what', 'when', 'where', 'which', 'have', 'does', 'been', 'will', 'can', 'should', 'could', 'would', 'typically', 'usually', 'approach', 'methodology'].includes(term))
+            .slice(0, 3);
+          
+          console.log('Previous key terms for topic continuation:', previousKeyTerms);
+          
+          // Combine current query with previous topic context
+          enhancedQuery = `${query} ${previousKeyTerms.join(' ')}`;
+          console.log('Enhanced query for topic continuation:', enhancedQuery);
+        }
+      } else {
+        // Fallback: treat as general query but with follow-up indication
+        console.log('Follow-up detected but no context available, treating as general query');
+        appliedFilters.contextSource = 'followup-no-context';
+      }
     }
 
     // Determine search strategy based on query type
@@ -700,12 +832,71 @@ export async function POST(request: NextRequest) {
         similarChunks = scoredChunks.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
       }
     } else {
-      // GENERAL QUERY: Use hybrid search (semantic + exact text matching)
-      console.log('Using hybrid search for general query');
-      const embedding = await generateEmbedding(enhancedQuery);
-      console.log('Generated embedding, length:', embedding.length);
-      similarChunks = await hybridSearchProposals(enhancedQuery, embedding, 10, searchFilters);
-      console.log('Found chunks:', similarChunks.length);
+      // Check if this is a methodology query that needs comprehensive search
+      const isMethodologyQuery = /how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/i.test(query) ||
+                                /what is (our|your) (typical|usual|standard|normal) approach/i.test(query) ||
+                                /what is (our|your) methodology/i.test(query) ||
+                                /best practices/i.test(query) ||
+                                /how (do|should) (we|you) approach/i.test(query);
+      
+      if (isMethodologyQuery) {
+        // METHODOLOGY QUERY: Search for all relevant proposals containing key terms
+        console.log('Methodology query detected, searching all relevant proposals');
+        
+        // Extract key terms from the query (e.g., "segmentation", "studies")
+        const keyTerms = query.toLowerCase()
+          .replace(/how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/gi, '')
+          .replace(/what is (our|your) (typical|usual|standard|normal) approach/gi, '')
+          .replace(/\b(to|for|the|and|or|in|on|at|with|about)\b/g, '')
+          .split(/\s+/)
+          .filter(term => term.length > 3 && !['what', 'when', 'where', 'which', 'have', 'does', 'been', 'will', 'can', 'should', 'could', 'would', 'typically', 'usually', 'approach', 'methodology'].includes(term))
+          .slice(0, 3); // Limit to top 3 meaningful terms
+        
+        console.log('Key terms for methodology search:', keyTerms);
+        
+        if (keyTerms.length > 0) {
+          // Search for proposals containing these key terms
+          const textSearchConditions = keyTerms.map(term => 
+            `content.ilike.%${term}%`
+          ).join(',');
+          
+          const { data: methodologyResults, error: methodologyError } = await supabaseAdmin
+            .from('proposals')
+            .select('*')
+            .or(textSearchConditions)
+            .limit(50) // Get more results for methodology synthesis
+            .order('created_at', { ascending: false });
+          
+          if (methodologyError) {
+            console.error('Error in methodology search:', methodologyError);
+            similarChunks = [];
+          } else {
+            similarChunks = methodologyResults || [];
+            console.log(`Methodology search found ${similarChunks.length} chunks for terms: ${keyTerms.join(', ')}`);
+            
+            // Rank by semantic similarity to the query
+            if (similarChunks.length > 0) {
+              const embedding = await generateEmbedding(enhancedQuery);
+              const scoredChunks = similarChunks.map(chunk => ({
+                ...chunk,
+                similarity: calculateTextSimilarity(enhancedQuery, chunk.content)
+              }));
+              similarChunks = scoredChunks.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
+            }
+          }
+        } else {
+          // Fallback to general search if no key terms found
+          const embedding = await generateEmbedding(enhancedQuery);
+          similarChunks = await hybridSearchProposals(enhancedQuery, embedding, 20, searchFilters);
+        }
+      } else {
+        // GENERAL QUERY: Use hybrid search (semantic + exact text matching)
+        console.log('Using hybrid search for general query');
+        const embedding = await generateEmbedding(enhancedQuery);
+        console.log('Generated embedding, length:', embedding.length);
+        similarChunks = await hybridSearchProposals(enhancedQuery, embedding, 10, searchFilters);
+        console.log('Found chunks:', similarChunks.length);
+      }
     }
     
     console.log('Applied filters:', searchFilters);
@@ -720,9 +911,13 @@ export async function POST(request: NextRequest) {
         answer: emptyMessage,
         sources: [],
         context: {
-          lastClient: explicitClient || context?.lastClient,
+          lastClient: explicitClient, // Only keep client if explicitly mentioned
           lastQuery: query
-        }
+        },
+        appliedFilters,
+        // For feedback system - even with no results, we want feedback
+        chunk_ids: [], // Empty array but still present so feedback buttons show
+        query_type: detectConsultantQueryType(query)
       });
     }
 
@@ -739,11 +934,14 @@ export async function POST(request: NextRequest) {
         answer: clarificationResponse,
         sources: [],
         context: {
-          lastClient: explicitClient || searchFilters.client || context?.lastClient,
+          lastClient: explicitClient || searchFilters.client, // Only keep client if explicitly mentioned
           lastQuery: query
         },
         appliedFilters,
-        suggestions: []
+        suggestions: [],
+        // For feedback system - even clarification requests need feedback
+        chunk_ids: correctedChunks.slice(0, 10).map(chunk => chunk.id), // Include some chunk IDs for context
+        query_type: detectConsultantQueryType(query)
       });
     }
 
@@ -762,9 +960,29 @@ export async function POST(request: NextRequest) {
     // Detect format preferences from the query
     const formatInstructions = extractFormatInstructions(query);
     
+    // Determine how many chunks to use based on query type
+    const isMethodologyQuery = /how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/i.test(query) ||
+                              /what is (our|your) (typical|usual|standard|normal) approach/i.test(query) ||
+                              /what is (our|your) methodology/i.test(query) ||
+                              /best practices/i.test(query) ||
+                              /how (do|should) (we|you) approach/i.test(query);
+    
+    // Use more chunks for methodology synthesis, fewer for specific queries
+    const chunksForAnswer = isMethodologyQuery ? 
+      correctedChunks.slice(0, 15) : // More data for methodology synthesis
+      correctedChunks.slice(0, 5);   // Standard amount for other queries
+    
+    console.log(`Using ${chunksForAnswer.length} chunks for answer generation (methodology: ${isMethodologyQuery})`);
+    
+    // Extract chunk IDs for feedback system
+    const usedChunkIds = chunksForAnswer.map(chunk => chunk.id);
+    
+    // Detect query type for feedback system
+    const queryType = detectConsultantQueryType(query);
+    
     const answer = await answerQuestion(
       contextualPrompt + query, 
-      correctedChunks.slice(0, 5), // Limit to top 5 for answer generation
+      chunksForAnswer,
       formatInstructions
     );
     console.log('Generated answer length:', answer.length);
@@ -775,22 +993,30 @@ export async function POST(request: NextRequest) {
     // Generate proactive suggestions
     const suggestions = generateProactiveFollowups(query, context || {}, correctedChunks);
 
+    const responseContext = {
+      lastClient: explicitClient || searchFilters.client, // Only keep client if explicitly mentioned
+      lastQuery: query,
+      lastSector: correctedChunks[0]?.sector,
+      lastSuccessfulResults: correctedChunks.length > 0 ? correctedChunks.slice(0, 10).map(chunk => ({
+        id: chunk.id,
+        filename: chunk.filename,
+        client: chunk.client || chunk.metadata?.client,
+        content: chunk.content
+      })) : undefined
+    };
+
+    console.log('=== RESPONSE CONTEXT BEING SENT ===');
+    console.log('Response context:', JSON.stringify(responseContext, null, 2));
+
     const response: AskResponse = {
       ...formattedResponse,
-      context: {
-        lastClient: explicitClient || searchFilters.client || context?.lastClient,
-        lastQuery: query,
-        lastSector: correctedChunks[0]?.sector,
-        lastSuccessfulResults: correctedChunks.length > 0 ? correctedChunks.slice(0, 10).map(chunk => ({
-          id: chunk.id,
-          filename: chunk.filename,
-          client: chunk.client || chunk.metadata?.client,
-          content: chunk.content
-        })) : undefined
-      },
+      context: responseContext,
       appliedFilters,
       suggestions,
-      duplicateWarnings: duplicateWarnings.length > 0 ? duplicateWarnings : undefined
+      duplicateWarnings: duplicateWarnings.length > 0 ? duplicateWarnings : undefined,
+      // For feedback system
+      chunk_ids: usedChunkIds,
+      query_type: queryType
     };
 
     console.log('=== ASK API SUCCESS ===');
