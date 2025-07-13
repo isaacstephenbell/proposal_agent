@@ -26,13 +26,14 @@ export async function searchSimilarProposals(
     sector?: string;
     client?: string;
     tags?: string[];
-  }
+  },
+  threshold: number = 0.2
 ): Promise<ProposalChunk[]> {
   try {
-          const { data, error } = await supabaseAdmin
-        .rpc('match_proposals', {
+    const { data, error } = await supabaseAdmin
+      .rpc('match_proposals', {
         query_embedding: embedding,
-        match_threshold: 0.2, // Lowered from 0.3 to 0.2 for more permissive matching
+        match_threshold: threshold,
         match_count: limit,
         filter_author: filters?.author || null,
         filter_sector: filters?.sector || null,
@@ -52,7 +53,178 @@ export async function searchSimilarProposals(
   }
 }
 
-// Hybrid search function that combines semantic + exact text matching
+// Advanced multi-stage search with query expansion and reranking
+export async function enhancedSearch(
+  query: string,
+  limit: number = 5,
+  filters?: {
+    author?: string;
+    sector?: string;
+    client?: string;
+    tags?: string[];
+  }
+): Promise<{
+  results: ProposalChunk[];
+  searchMetadata: {
+    queryExpansion: any;
+    stageResults: {
+      semantic: number;
+      reranked: number;
+      diversified: number;
+    };
+    processingTime: number;
+  };
+}> {
+  const startTime = Date.now();
+  
+  try {
+    console.log(`🚀 ENHANCED SEARCH for query: "${query}"`);
+    
+    // Stage 1: Query expansion and multiple embeddings
+    const { generateExpandedEmbeddings } = await import('./openai');
+    const expansionData = await generateExpandedEmbeddings(query);
+    
+    console.log(`📈 Query expanded: "${expansionData.expansion.expandedQuery}"`);
+    console.log(`🔍 Synonyms: ${expansionData.expansion.synonyms.join(', ')}`);
+    
+    // Stage 2: Multi-embedding semantic search (high recall, lower precision)
+    const candidateResults = await Promise.all([
+      searchSimilarProposals(expansionData.originalEmbedding, limit * 4, filters, 0.1),
+      searchSimilarProposals(expansionData.expandedEmbedding, limit * 4, filters, 0.1),
+      ...expansionData.synonymEmbeddings.map(embedding => 
+        searchSimilarProposals(embedding, limit * 2, filters, 0.1)
+      )
+    ]);
+    
+    // Combine and deduplicate results
+    const allCandidates = candidateResults.flat();
+    const uniqueCandidates = Array.from(
+      new Map(allCandidates.map(chunk => [chunk.id, chunk])).values()
+    );
+    
+    console.log(`🧠 Stage 1 - Semantic search: ${uniqueCandidates.length} candidates`);
+    
+    // Stage 3: Cross-encoder reranking for precision
+    const rerankedResults = await crossEncoderRerank(query, uniqueCandidates, limit * 2);
+    
+    console.log(`🎯 Stage 2 - Reranked: ${rerankedResults.length} results`);
+    
+    // Stage 4: Diversity filtering (avoid too many chunks from same document)
+    const diversifiedResults = diversityFilter(rerankedResults, limit, 2);
+    
+    console.log(`🌈 Stage 3 - Diversified: ${diversifiedResults.length} final results`);
+    
+    const processingTime = Date.now() - startTime;
+    
+    return {
+      results: diversifiedResults,
+      searchMetadata: {
+        queryExpansion: expansionData.expansion,
+        stageResults: {
+          semantic: uniqueCandidates.length,
+          reranked: rerankedResults.length,
+          diversified: diversifiedResults.length
+        },
+        processingTime
+      }
+    };
+    
+  } catch (error) {
+    console.error('Error in enhancedSearch:', error);
+    
+    // Fallback to simple semantic search
+    const { generateEmbedding } = await import('./openai');
+    const embedding = await generateEmbedding(query);
+    const fallbackResults = await searchSimilarProposals(embedding, limit, filters);
+    
+    return {
+      results: fallbackResults,
+      searchMetadata: {
+        queryExpansion: { originalQuery: query, expandedQuery: query, synonyms: [], relatedTerms: [] },
+        stageResults: { semantic: fallbackResults.length, reranked: 0, diversified: 0 },
+        processingTime: Date.now() - startTime
+      }
+    };
+  }
+}
+
+// Cross-encoder reranking for precise relevance scoring
+async function crossEncoderRerank(query: string, candidates: ProposalChunk[], limit: number): Promise<ProposalChunk[]> {
+  try {
+    const { default: OpenAI } = await import('openai');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    
+    // Use GPT-4 as a cross-encoder for precise relevance scoring
+    const scoringPrompt = `
+Rate the relevance of each text chunk to the query on a scale of 0-100.
+Consider semantic meaning, context, and specific details.
+
+Query: "${query}"
+
+Chunks to score:
+${candidates.map((chunk, index) => `
+${index + 1}. Client: ${chunk.metadata?.client || 'Unknown'}
+Content: ${chunk.content.substring(0, 300)}...
+`).join('\n')}
+
+Return only a JSON array of scores: [score1, score2, ...]`;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4',
+      messages: [
+        { role: 'system', content: 'You are a precise relevance scorer for consulting document search.' },
+        { role: 'user', content: scoringPrompt }
+      ],
+      temperature: 0.1,
+      max_tokens: 200
+    });
+    
+    const content = response.choices[0].message?.content || '[]';
+    
+    try {
+      const scores = JSON.parse(content);
+      
+      // Combine chunks with scores and sort by relevance
+      const scoredChunks = candidates.map((chunk, index) => ({
+        ...chunk,
+        crossEncoderScore: scores[index] || 0
+      })).sort((a, b) => b.crossEncoderScore - a.crossEncoderScore);
+      
+      return scoredChunks.slice(0, limit);
+    } catch (parseError) {
+      console.warn('Failed to parse cross-encoder scores, using original order');
+      return candidates.slice(0, limit);
+    }
+    
+  } catch (error) {
+    console.error('Error in cross-encoder reranking:', error);
+    return candidates.slice(0, limit);
+  }
+}
+
+// Diversity filtering to avoid too many chunks from the same document
+function diversityFilter(chunks: ProposalChunk[], limit: number, maxPerDocument: number = 2): ProposalChunk[] {
+  const documentCounts = new Map<string, number>();
+  const filteredChunks: ProposalChunk[] = [];
+  
+  for (const chunk of chunks) {
+    const documentId = chunk.metadata?.filename || 'unknown';
+    const currentCount = documentCounts.get(documentId) || 0;
+    
+    if (currentCount < maxPerDocument) {
+      filteredChunks.push(chunk);
+      documentCounts.set(documentId, currentCount + 1);
+      
+      if (filteredChunks.length >= limit) {
+        break;
+      }
+    }
+  }
+  
+  return filteredChunks;
+}
+
+// Legacy hybrid search function (kept for backward compatibility)
 export async function hybridSearchProposals(
   query: string,
   embedding: number[],
@@ -65,78 +237,12 @@ export async function hybridSearchProposals(
   }
 ): Promise<ProposalChunk[]> {
   try {
-    console.log(`🔍 HYBRID SEARCH for query: "${query}"`);
-    console.log(`📊 Filters applied:`, filters);
+    console.log(`🔍 LEGACY HYBRID SEARCH for query: "${query}"`);
     
-    // First try semantic search with lower threshold for better results
-    console.log(`🧠 Trying semantic search...`);
-    const semanticResults = await searchSimilarProposals(embedding, limit, filters);
-    console.log(`🧠 Semantic search found ${semanticResults.length} results`);
+    // Use enhanced search but return only results for compatibility
+    const { results } = await enhancedSearch(query, limit, filters);
+    return results;
     
-    // If semantic search returns results, use them
-    if (semanticResults.length > 0) {
-      console.log(`✅ Using semantic search results`);
-      return semanticResults;
-    }
-    
-    // If no semantic results, try exact text search for specific terms
-    console.log('⚠️ Semantic search returned no results, trying text search for:', query);
-    
-    // Extract potential exact match terms from query
-    const exactTerms = extractExactTerms(query);
-    
-    if (exactTerms.length > 0) {
-      console.log('🔤 Searching for exact terms:', exactTerms);
-      
-      // Build text search query
-      const textSearchConditions = exactTerms.map(term => 
-        `content.ilike.%${term}%`
-      ).join(',');
-      
-      console.log('🔤 Text search conditions:', textSearchConditions);
-      
-      let textQuery = supabaseAdmin
-        .from('proposals')
-        .select('*')
-        .or(textSearchConditions);
-      
-      // Apply filters if provided
-      if (filters?.author) {
-        textQuery = textQuery.eq('author', filters.author);
-        console.log('🔤 Applied author filter:', filters.author);
-      }
-      if (filters?.sector) {
-        textQuery = textQuery.eq('sector', filters.sector);
-        console.log('🔤 Applied sector filter:', filters.sector);
-      }
-      if (filters?.client) {
-        textQuery = textQuery.eq('client', filters.client);
-        console.log('🔤 Applied client filter:', filters.client);
-      }
-      if (filters?.tags && filters.tags.length > 0) {
-        textQuery = textQuery.overlaps('tags', filters.tags);
-        console.log('🔤 Applied tags filter:', filters.tags);
-      }
-      
-      const { data: textResults, error: textError } = await textQuery
-        .limit(limit)
-        .order('created_at', { ascending: false });
-      
-      if (textError) {
-        console.error('❌ Error in text search:', textError);
-        return [];
-      }
-      
-      console.log(`🔤 Text search found ${textResults?.length || 0} results`);
-      if (textResults && textResults.length > 0) {
-        console.log('🔤 Text search result clients:', textResults.map(r => r.client).slice(0, 3));
-      }
-      return textResults || [];
-    } else {
-      console.log('🔤 No exact terms found in query, returning empty results');
-    }
-    
-    return [];
   } catch (error) {
     console.error('Error in hybridSearchProposals:', error);
     return [];

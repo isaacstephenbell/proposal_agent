@@ -80,15 +80,32 @@ export interface GeneratedProposal {
 
 // Enhanced with context tracking
 export interface ConversationContext {
-  lastClient?: string;
-  lastSector?: string;
-  lastQuery?: string;
+  conversationHistory: Array<{
+    query: string;
+    response: string;
+    entities: string[]; // [Mo'Bettahs, Crux Capital, etc.]
+    queryType: string;
+    resultChunks: string[];
+    timestamp: Date;
+  }>;
+  activeEntities: {
+    currentClient?: string;
+    currentProject?: string;
+    currentSector?: string;
+    discussedClients: string[];
+    discussedProjects: string[];
+  };
   lastSuccessfulResults?: Array<{
     id: string;
     filename: string;
     client: string;
     content: string;
   }>;
+  conversationTurn: number;
+  // Legacy fields for backward compatibility
+  lastClient?: string;
+  lastSector?: string;
+  lastQuery?: string;
 }
 
 export interface AppliedFilters {
@@ -131,6 +148,8 @@ export interface AskResponse {
       date: number;
     };
     duplicates?: DuplicateInfo[];
+    qualityScore?: number;
+    crossEncoderScore?: number;
   }>;
   context?: ConversationContext;
   appliedFilters?: AppliedFilters;
@@ -139,6 +158,22 @@ export interface AskResponse {
   // For feedback system
   chunk_ids?: string[];
   query_type?: string;
+  // For performance monitoring
+  searchMetadata?: {
+    queryExpansion?: {
+      originalQuery: string;
+      expandedQuery: string;
+      synonyms: string[];
+      relatedTerms: string[];
+    };
+    stageResults?: {
+      semantic: number;
+      reranked: number;
+      diversified: number;
+    };
+    processingTime?: number;
+    searchStrategy?: string;
+  };
 }
 
 export interface GenerateRequest {

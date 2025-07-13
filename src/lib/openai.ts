@@ -22,6 +22,121 @@ export async function generateEmbedding(text: string): Promise<number[]> {
   }
 }
 
+// Query expansion for better semantic matching
+export async function expandQuery(query: string): Promise<{
+  originalQuery: string;
+  expandedQuery: string;
+  synonyms: string[];
+  relatedTerms: string[];
+}> {
+  try {
+    const expansionPrompt = `
+Analyze this search query and provide semantic expansion to improve search results:
+
+Query: "${query}"
+
+Provide:
+1. Synonyms for key terms
+2. Related concepts and terms
+3. Industry-specific variations
+4. Alternative phrasings
+
+Focus on consulting/business terminology. Return as JSON:
+{
+  "synonyms": ["term1", "term2"],
+  "relatedTerms": ["concept1", "concept2"],
+  "expandedQuery": "expanded version of the query"
+}`;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4',
+      messages: [
+        { role: 'system', content: 'You are a semantic search expert specializing in business consulting terminology.' },
+        { role: 'user', content: expansionPrompt }
+      ],
+      temperature: 0.3,
+      max_tokens: 500
+    });
+
+    const content = response.choices[0].message?.content || '{}';
+    
+    try {
+      const parsed = JSON.parse(content);
+      return {
+        originalQuery: query,
+        expandedQuery: parsed.expandedQuery || query,
+        synonyms: parsed.synonyms || [],
+        relatedTerms: parsed.relatedTerms || []
+      };
+    } catch (parseError) {
+      console.warn('Failed to parse query expansion response:', parseError);
+      return {
+        originalQuery: query,
+        expandedQuery: query,
+        synonyms: [],
+        relatedTerms: []
+      };
+    }
+  } catch (error) {
+    console.error('Error expanding query:', error);
+    return {
+      originalQuery: query,
+      expandedQuery: query,
+      synonyms: [],
+      relatedTerms: []
+    };
+  }
+}
+
+// Generate multiple embeddings for expanded query terms
+export async function generateExpandedEmbeddings(query: string): Promise<{
+  originalEmbedding: number[];
+  expandedEmbedding: number[];
+  synonymEmbeddings: number[][];
+  expansion: {
+    originalQuery: string;
+    expandedQuery: string;
+    synonyms: string[];
+    relatedTerms: string[];
+  };
+}> {
+  try {
+    const expansion = await expandQuery(query);
+    
+    // Generate embeddings for original and expanded queries
+    const [originalEmbedding, expandedEmbedding] = await Promise.all([
+      generateEmbedding(expansion.originalQuery),
+      generateEmbedding(expansion.expandedQuery)
+    ]);
+    
+    // Generate embeddings for synonyms
+    const synonymEmbeddings = await Promise.all(
+      expansion.synonyms.slice(0, 3).map(synonym => generateEmbedding(synonym))
+    );
+    
+    return {
+      originalEmbedding,
+      expandedEmbedding,
+      synonymEmbeddings,
+      expansion
+    };
+  } catch (error) {
+    console.error('Error generating expanded embeddings:', error);
+    const fallbackEmbedding = await generateEmbedding(query);
+    return {
+      originalEmbedding: fallbackEmbedding,
+      expandedEmbedding: fallbackEmbedding,
+      synonymEmbeddings: [],
+      expansion: {
+        originalQuery: query,
+        expandedQuery: query,
+        synonyms: [],
+        relatedTerms: []
+      }
+    };
+  }
+}
+
 // Generate proposal based on retrieved chunks
 export async function generateProposal(
   problem: string,

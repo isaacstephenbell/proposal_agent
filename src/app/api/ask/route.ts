@@ -499,7 +499,7 @@ function calculateTextSimilarity(text1: string, text2: string): number {
   const words2 = new Set(text2.toLowerCase().split(/\s+/));
   
   const intersection = new Set(Array.from(words1).filter(x => words2.has(x)));
-  const union = new Set([...Array.from(words1), ...Array.from(words2)]);
+      const union = new Set(Array.from(words1).concat(Array.from(words2)));
   
   return intersection.size / union.size;
 }
@@ -677,6 +677,204 @@ function formatResponseForQuery(query: string, chunks: any[], answer: string): {
   return { answer, sources };
 }
 
+// Enhanced context retention functions
+function extractEntitiesFromResponse(response: string, chunks: any[]): string[] {
+  const entities = [];
+  
+  // Extract client names from chunks
+  const clients = chunks.map(c => c.client || c.metadata?.client).filter(Boolean);
+  entities.push(...clients);
+  
+  // Extract project names from response
+  const projectMatches = response.match(/Project Name?:\s*([^\n]+)/gi);
+  if (projectMatches) {
+    entities.push(...projectMatches.map(m => m.split(':')[1].trim()));
+  }
+  
+  // Extract company names from response (look for capitalized phrases)
+  const companyMatches = response.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+(?:Inc|Corp|LLC|Ltd|Company|Group|Partners))?/g);
+  if (companyMatches) {
+    // Filter out common words and keep only likely company names
+    const filteredCompanies = companyMatches.filter(match => 
+      !['The', 'This', 'That', 'These', 'Those', 'Project', 'Client', 'Company', 'Team', 'Work', 'Phase', 'Stage'].includes(match) &&
+      match.length > 3
+    );
+    entities.push(...filteredCompanies.slice(0, 5)); // Limit to avoid noise
+  }
+  
+  // Remove duplicates manually
+  const uniqueEntities: string[] = [];
+  for (const entity of entities) {
+    if (!uniqueEntities.includes(entity)) {
+      uniqueEntities.push(entity);
+    }
+  }
+  
+  return uniqueEntities;
+}
+
+function extractProjectNameFromResponse(response: string): string | undefined {
+  // Look for project name patterns in the response
+  const projectPatterns = [
+    /Project Name?:\s*([^\n]+)/i,
+    /project called\s+([^\n,]+)/i,
+    /project for\s+([^\n,]+)/i,
+    /working on\s+([^\n,]+)/i
+  ];
+  
+  for (const pattern of projectPatterns) {
+    const match = response.match(pattern);
+    if (match) {
+      return match[1].trim();
+    }
+  }
+  
+  return undefined;
+}
+
+function resolveFollowUpReference(query: string, context: ConversationContext): { expandedQuery: string; shouldUseRecentChunks: boolean; targetEntities: string[] } {
+  const pronounReferences = [
+    'who was the project lead',
+    'who was the author', 
+    'who led this',
+    'what was the timeline',
+    'tell me more about this',
+    'what was the outcome',
+    'what were the deliverables',
+    'how long did it take',
+    'what was the approach',
+    'who was involved',
+    'what was the budget',
+    'when did this happen'
+  ];
+  
+  const hasPronouns = pronounReferences.some(ref => 
+    query.toLowerCase().includes(ref.toLowerCase())
+  );
+  
+  if (hasPronouns && context.conversationHistory && context.conversationHistory.length > 0) {
+    // Get the most recent entities discussed
+    const recentHistory = context.conversationHistory.slice(-3);
+    const recentEntities = recentHistory.flatMap(h => h.entities);
+    
+    // Prioritize current active entities
+    const targetEntities = [
+      context.activeEntities?.currentProject,
+      context.activeEntities?.currentClient,
+      ...recentEntities
+    ].filter((entity): entity is string => Boolean(entity));
+    
+    // Expand query with context
+    return {
+      expandedQuery: `${query} for ${targetEntities.slice(0, 2).join(' ')}`,
+      shouldUseRecentChunks: true,
+      targetEntities: targetEntities.slice(0, 3)
+    };
+  }
+  
+  return { expandedQuery: query, shouldUseRecentChunks: false, targetEntities: [] };
+}
+
+function resolvePronounsInQuery(query: string, context: ConversationContext): string {
+  let resolvedQuery = query;
+  
+  // "who was the project lead?" → "who was the project lead for Mo'Bettahs?"
+  if (query.match(/who was (the )?(project lead|author|lead)/i)) {
+    const recentClient = context.activeEntities?.currentClient;
+    const recentProject = context.activeEntities?.currentProject;
+    
+    if (recentClient || recentProject) {
+      resolvedQuery += ` for ${recentProject || recentClient}`;
+    }
+  }
+  
+  // "what was the timeline?" → "what was the timeline for Mo'Bettahs project?"
+  if (query.match(/what was (the )?(timeline|duration|schedule|approach|outcome|result)/i)) {
+    const recentEntity = context.activeEntities?.currentClient || 
+                        context.activeEntities?.currentProject;
+    if (recentEntity) {
+      resolvedQuery += ` for ${recentEntity}`;
+    }
+  }
+  
+  // "tell me more" → "tell me more about Mo'Bettahs"
+  if (query.match(/tell me more|more details|more information|additional details/i)) {
+    const recentEntity = context.activeEntities?.currentProject || 
+                        context.activeEntities?.currentClient;
+    if (recentEntity) {
+      resolvedQuery = `tell me more about ${recentEntity}`;
+    }
+  }
+  
+  return resolvedQuery;
+}
+
+async function searchWithinChunks(query: string, chunkIds: string[], options: { fallbackToGlobal?: boolean } = {}): Promise<any[]> {
+  try {
+    // First, try to search within the specified chunks
+    const { data: recentChunks, error: recentError } = await supabaseAdmin
+      .from('proposals')
+      .select('*')
+      .in('id', chunkIds)
+      .limit(10);
+    
+    if (recentError) {
+      console.error('Error fetching recent chunks:', recentError);
+      if (options.fallbackToGlobal) {
+        // Fallback to global search
+        const embedding = await generateEmbedding(query);
+        return await hybridSearchProposals(query, embedding, 10, {});
+      }
+      return [];
+    }
+    
+    const chunks = recentChunks || [];
+    
+    // Rank by semantic similarity to the query
+    if (chunks.length > 0) {
+      const scoredChunks = chunks.map(chunk => ({
+        ...chunk,
+        similarity: calculateTextSimilarity(query, chunk.content)
+      }));
+      const sortedChunks = scoredChunks.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
+      
+      // If we have good matches, return them
+      if (sortedChunks.length > 0 && sortedChunks[0].similarity > 0.1) {
+        return sortedChunks;
+      }
+    }
+    
+    // If no good matches and fallback is enabled, do global search
+    if (options.fallbackToGlobal) {
+      console.log('No good matches in recent chunks, falling back to global search');
+      const embedding = await generateEmbedding(query);
+      return await hybridSearchProposals(query, embedding, 10, {});
+    }
+    
+    return chunks;
+  } catch (error) {
+    console.error('Error in searchWithinChunks:', error);
+    return [];
+  }
+}
+
+// Helper function to create default conversation context
+function createDefaultContext(context?: ConversationContext): ConversationContext {
+  return {
+    conversationHistory: context?.conversationHistory || [],
+    activeEntities: context?.activeEntities || {
+      discussedClients: [],
+      discussedProjects: []
+    },
+    conversationTurn: (context?.conversationTurn || 0) + 1,
+    lastSuccessfulResults: context?.lastSuccessfulResults,
+    // Legacy fields for backward compatibility
+    lastClient: context?.lastClient,
+    lastSector: context?.lastSector,
+    lastQuery: context?.lastQuery
+  };
+}
+
 export async function POST(request: NextRequest) {
   try {
     console.log('=== ASK API START ===');
@@ -692,8 +890,10 @@ export async function POST(request: NextRequest) {
     console.log('=== REQUEST DETAILS ===');
     console.log('Query:', query);
     console.log('Context received:', JSON.stringify(context, null, 2));
-    console.log('Context keys:', context ? Object.keys(context) : 'null');
-    console.log('Context type:', typeof context);
+
+    // Create enhanced context with defaults
+    const enhancedContext = createDefaultContext(context);
+    console.log('Enhanced context created:', JSON.stringify(enhancedContext, null, 2));
 
     // Check for ambiguity first
     const ambiguityCheck = detectAmbiguity(query);
@@ -701,163 +901,97 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         answer: `I need clarification: ${ambiguityCheck.clarification}`,
         sources: [],
-        context: context || {},
+        context: enhancedContext,
         appliedFilters: { contextSource: 'none' },
-        // For feedback system - even clarification requests need feedback
-        chunk_ids: [], // Empty array but present so feedback buttons show
+        chunk_ids: [],
         query_type: detectConsultantQueryType(query)
       });
     }
 
-    // Smart context detection
+    // Smart context detection with enhanced follow-up resolution
     let searchFilters: any = {};
     let enhancedQuery = query;
     
-    // Determine if this is a follow-up query FIRST
-    const isFollowUp = isFollowUpQuery(query, context);
-    console.log('🔄 Follow-up Detection for query "' + query + '":', isFollowUp);
-    console.log('📋 Context received:', JSON.stringify(context, null, 2));
+    // Determine if this is a follow-up query
+    const isFollowUp = isFollowUpQuery(query, enhancedContext);
+    console.log('🔄 Follow-up Detection:', isFollowUp);
     
-    // Test the new patterns manually
-    const testPatterns = [
-      { name: 'Demonstrative pronouns', pattern: /^(the|that|this|those|these)\s/i },
-      { name: 'Continuation requests', pattern: /\b(more|additional|other|similar|else)\b/i },
-      { name: 'Details requests', pattern: /\b(details?|information|specifics)\b/i },
-      { name: 'Question starters', pattern: /^(any|anything|can you|do we|did we|have we|tell me|show me|give me)\b/i },
-      { name: 'Short queries', pattern: query.toLowerCase().length < 20 && !/^(what|how|when|where|which|who|why)\b/i.test(query.toLowerCase()) },
-      { name: 'Reference pronouns', pattern: /\b(them|it|they)\b/i }
-    ];
-    console.log('🔍 Pattern tests:');
-    testPatterns.forEach((test, i) => {
-      const result = typeof test.pattern === 'boolean' ? test.pattern : test.pattern.test(query);
-      console.log(`  ${test.name}: ${result}`);
-    });
+    // Apply pronoun resolution if this is a follow-up
+    if (isFollowUp) {
+      enhancedQuery = resolvePronounsInQuery(query, enhancedContext);
+      console.log('🔧 Pronoun-resolved query:', enhancedQuery);
+      
+      // Try advanced follow-up reference resolution
+      const followUpResolution = resolveFollowUpReference(query, enhancedContext);
+      if (followUpResolution.shouldUseRecentChunks) {
+        enhancedQuery = followUpResolution.expandedQuery;
+        console.log('🎯 Follow-up resolved query:', enhancedQuery);
+      }
+    }
     
-    // Only extract explicit client if this is NOT a follow-up query
+    // Extract explicit client only if not a follow-up
     const explicitClient = isFollowUp ? null : extractClientFromQuery(query);
-    console.log('👤 Client Extraction (isFollowUp=' + isFollowUp + '):', explicitClient);
+    console.log('👤 Client Extraction:', explicitClient);
     
-    // Track applied filters for explainability
+    // Track applied filters
     const appliedFilters: AppliedFilters = {
       contextSource: 'none'
     };
     
-    // Apply context-aware filtering (simplified and more robust)
+    // Apply context-aware filtering
     if (explicitClient) {
-      // Explicit client mentioned - use it and update context
       searchFilters.client = explicitClient;
       appliedFilters.client = explicitClient;
       appliedFilters.contextSource = 'explicit';
-      console.log('Explicit client detected:', explicitClient);
     } else if (isFollowUp) {
-      // Follow-up query - try multiple context sources
-      console.log('Follow-up query detected, applying context...');
+      // Enhanced follow-up handling
+      const followUpResolution = resolveFollowUpReference(query, enhancedContext);
       
-      if (context?.lastSuccessfulResults && context.lastSuccessfulResults.length > 0) {
-        // Use previous successful results
+      if (followUpResolution.shouldUseRecentChunks && enhancedContext.conversationHistory.length > 0) {
+        // Use recent conversation context
         appliedFilters.contextSource = 'topic-followup';
-        const previousResultIds = context.lastSuccessfulResults.map((r: any) => r.id);
-        console.log('Using previous result IDs:', previousResultIds.slice(0, 5));
-        searchFilters.previousResultIds = previousResultIds;
-      } else if (context?.lastClient) {
-        // Use previous client context
+        const recentChunkIds = enhancedContext.conversationHistory
+          .slice(-3)
+          .flatMap(h => h.resultChunks);
+        searchFilters.previousResultIds = recentChunkIds;
+        console.log('Using recent chunk IDs:', recentChunkIds.slice(0, 5));
+      } else if (enhancedContext.activeEntities?.currentClient) {
+        // Use current client context
         appliedFilters.contextSource = 'client-followup';
-        searchFilters.client = context.lastClient;
-        console.log('Using previous client context:', context.lastClient);
-      } else if (context?.lastQuery) {
-        // Use previous query context
-        appliedFilters.contextSource = 'topic-continuation';
-        
-        // Special handling for ambiguity resolution responses
-        const isAmbiguityResolution = ['external', 'internal', 'client', 'project management', 'change management', 'executive management', 'business development', 'software development', 'talent development'].includes(query.toLowerCase().trim());
-        
-        if (isAmbiguityResolution) {
-          // For ambiguity resolution, combine the resolution with key terms from previous query
-          const previousKeyTerms = context.lastQuery.toLowerCase()
-            .replace(/how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/gi, '')
-            .replace(/what is (our|your) (typical|usual|standard|normal) approach/gi, '')
-            .replace(/\b(to|for|the|and|or|in|on|at|with|about|can|you|tell|me|consulting|work|have|done|we|you)\b/g, '')
-            .split(/\s+/)
-            .filter(term => term.length > 3 && !['what', 'when', 'where', 'which', 'have', 'does', 'been', 'will', 'can', 'should', 'could', 'would', 'typically', 'usually', 'approach', 'methodology'].includes(term))
-            .slice(0, 4); // Get more key terms for better context
-          
-          console.log('🔧 Ambiguity resolution detected. Previous key terms:', previousKeyTerms);
-          
-          // Combine resolution with previous context - prioritize the key terms
-          enhancedQuery = `${query} ${previousKeyTerms.join(' ')}`;
-          console.log('🔧 Enhanced query for ambiguity resolution:', enhancedQuery);
-        } else {
-          // Regular topic continuation
-          const previousKeyTerms = context.lastQuery.toLowerCase()
-            .replace(/how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/gi, '')
-            .replace(/what is (our|your) (typical|usual|standard|normal) approach/gi, '')
-            .replace(/\b(to|for|the|and|or|in|on|at|with|about|can|you|tell|me)\b/g, '')
-            .split(/\s+/)
-            .filter(term => term.length > 3 && !['what', 'when', 'where', 'which', 'have', 'does', 'been', 'will', 'can', 'should', 'could', 'would', 'typically', 'usually', 'approach', 'methodology'].includes(term))
-            .slice(0, 3);
-          
-          console.log('Previous key terms for topic continuation:', previousKeyTerms);
-          
-          // Combine current query with previous topic context
-          enhancedQuery = `${query} ${previousKeyTerms.join(' ')}`;
-          console.log('Enhanced query for topic continuation:', enhancedQuery);
-        }
+        searchFilters.client = enhancedContext.activeEntities.currentClient;
+        console.log('Using current client context:', enhancedContext.activeEntities.currentClient);
+      } else if (enhancedContext.lastClient) {
+        // Fallback to legacy client context
+        appliedFilters.contextSource = 'client-followup';
+        searchFilters.client = enhancedContext.lastClient;
+        console.log('Using legacy client context:', enhancedContext.lastClient);
       } else {
-        // Fallback: treat as general query but with follow-up indication
-        console.log('Follow-up detected but no context available, treating as general query');
         appliedFilters.contextSource = 'followup-no-context';
       }
     }
 
-    // Determine search strategy based on query type
+    // Determine search strategy
     let similarChunks: any[] = [];
+    let searchResult: any = null;
     
-    if (searchFilters.previousResultIds) {
-      // TOPIC FOLLOW-UP QUERY: Use previous successful results
-      console.log('Using previous successful results for topic follow-up');
-      const { data: previousResults, error: prevError } = await supabaseAdmin
-        .from('proposals')
-        .select('*')
-        .in('id', searchFilters.previousResultIds)
-        .limit(10);
-      
-      if (prevError) {
-        console.error('Error fetching previous results:', prevError);
-        similarChunks = [];
-      } else {
-        similarChunks = previousResults || [];
-        console.log(`Found ${similarChunks.length} chunks from previous context`);
-        
-        // Optionally rank by semantic similarity to the new query
-        if (similarChunks.length > 0) {
-          const embedding = await generateEmbedding(enhancedQuery);
-          const scoredChunks = similarChunks.map(chunk => ({
-            ...chunk,
-            similarity: calculateTextSimilarity(enhancedQuery, chunk.content)
-          }));
-          similarChunks = scoredChunks.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
-        }
-      }
+    if (searchFilters.previousResultIds && searchFilters.previousResultIds.length > 0) {
+      // CONTEXTUAL FOLLOW-UP: Search within recent results
+      console.log('Using contextual follow-up search');
+      similarChunks = await searchWithinChunks(enhancedQuery, searchFilters.previousResultIds, { fallbackToGlobal: true });
     } else if (searchFilters.client) {
-      // CLIENT-SPECIFIC QUERY: Use comprehensive search to get ALL client work
-      console.log(`Using comprehensive client search for: ${searchFilters.client}`);
+      // CLIENT-SPECIFIC QUERY
+      console.log(`Using client-specific search for: ${searchFilters.client}`);
       similarChunks = await getAllProposalsForClient(searchFilters.client);
-      console.log(`Found ${similarChunks.length} total chunks for ${searchFilters.client}`);
       
-      // If we have too many results, we can optionally rank by semantic similarity
       if (similarChunks.length > 20) {
-        console.log('Many results found, ranking by semantic similarity...');
-        const embedding = await generateEmbedding(enhancedQuery);
-        // Keep all chunks but add similarity scores for ranking
         const scoredChunks = similarChunks.map(chunk => ({
           ...chunk,
           similarity: calculateTextSimilarity(enhancedQuery, chunk.content)
         }));
-        // Sort by similarity but keep all chunks
         similarChunks = scoredChunks.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
       }
     } else {
-      // Check if this is a methodology query that needs comprehensive search
+      // Check for methodology query
       const isMethodologyQuery = /how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/i.test(query) ||
                                 /what is (our|your) (typical|usual|standard|normal) approach/i.test(query) ||
                                 /what is (our|your) methodology/i.test(query) ||
@@ -865,31 +999,23 @@ export async function POST(request: NextRequest) {
                                 /how (do|should) (we|you) approach/i.test(query);
       
       if (isMethodologyQuery) {
-        // METHODOLOGY QUERY: Search for all relevant proposals containing key terms
-        console.log('Methodology query detected, searching all relevant proposals');
-        
-        // Extract key terms from the query (e.g., "segmentation", "studies")
+        // METHODOLOGY QUERY
+        console.log('Using methodology search');
         const keyTerms = query.toLowerCase()
           .replace(/how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/gi, '')
           .replace(/what is (our|your) (typical|usual|standard|normal) approach/gi, '')
           .replace(/\b(to|for|the|and|or|in|on|at|with|about)\b/g, '')
           .split(/\s+/)
           .filter(term => term.length > 3 && !['what', 'when', 'where', 'which', 'have', 'does', 'been', 'will', 'can', 'should', 'could', 'would', 'typically', 'usually', 'approach', 'methodology'].includes(term))
-          .slice(0, 3); // Limit to top 3 meaningful terms
-        
-        console.log('Key terms for methodology search:', keyTerms);
+          .slice(0, 3);
         
         if (keyTerms.length > 0) {
-          // Search for proposals containing these key terms
-          const textSearchConditions = keyTerms.map(term => 
-            `content.ilike.%${term}%`
-          ).join(',');
-          
+          const textSearchConditions = keyTerms.map(term => `content.ilike.%${term}%`).join(',');
           const { data: methodologyResults, error: methodologyError } = await supabaseAdmin
             .from('proposals')
             .select('*')
             .or(textSearchConditions)
-            .limit(50) // Get more results for methodology synthesis
+            .limit(50)
             .order('created_at', { ascending: false });
           
           if (methodologyError) {
@@ -897,11 +1023,7 @@ export async function POST(request: NextRequest) {
             similarChunks = [];
           } else {
             similarChunks = methodologyResults || [];
-            console.log(`Methodology search found ${similarChunks.length} chunks for terms: ${keyTerms.join(', ')}`);
-            
-            // Rank by semantic similarity to the query
             if (similarChunks.length > 0) {
-              const embedding = await generateEmbedding(enhancedQuery);
               const scoredChunks = similarChunks.map(chunk => ({
                 ...chunk,
                 similarity: calculateTextSimilarity(enhancedQuery, chunk.content)
@@ -910,70 +1032,52 @@ export async function POST(request: NextRequest) {
             }
           }
         } else {
-          // Fallback to general search if no key terms found
           const embedding = await generateEmbedding(enhancedQuery);
           similarChunks = await hybridSearchProposals(enhancedQuery, embedding, 20, searchFilters);
         }
       } else {
-        // GENERAL QUERY: Use hybrid search (semantic + exact text matching)
-        console.log('Using hybrid search for general query');
-        const embedding = await generateEmbedding(enhancedQuery);
-        console.log('Generated embedding, length:', embedding.length);
-        similarChunks = await hybridSearchProposals(enhancedQuery, embedding, 10, searchFilters);
-        console.log('Found chunks:', similarChunks.length);
+        // GENERAL QUERY: Use enhanced multi-stage search
+        console.log('Using enhanced multi-stage search');
+        const { enhancedSearch } = await import('@/lib/supabase');
+        searchResult = await enhancedSearch(enhancedQuery, 10, searchFilters);
+        similarChunks = searchResult.results;
       }
     }
-    
-    console.log('Applied filters:', searchFilters);
 
     if (similarChunks.length === 0) {
-      console.log('No chunks found, returning empty response');
       const emptyMessage = searchFilters.client 
-        ? `I don't have any historical proposals for ${searchFilters.client} that match your question. Please try rephrasing or ask about a different topic.`
-        : "I don't have any historical proposals that match your question. Please try rephrasing or ask about a different topic.";
+        ? `I don't have any historical proposals for ${searchFilters.client} that match your question.`
+        : "I don't have any historical proposals that match your question.";
       
       return NextResponse.json({
         answer: emptyMessage,
         sources: [],
-        context: {
-          lastClient: explicitClient, // Only keep client if explicitly mentioned
-          lastQuery: query
-        },
+        context: enhancedContext,
         appliedFilters,
-        // For feedback system - even with no results, we want feedback
-        chunk_ids: [], // Empty array but still present so feedback buttons show
+        chunk_ids: [],
         query_type: detectConsultantQueryType(query)
       });
     }
 
-    // No additional filtering needed - comprehensive client search already filtered by client
-    const chunksToUse = similarChunks;
+    // Apply corrections and continue with existing logic
+    const correctedChunks = await applyCorrections(similarChunks);
 
-    // Apply learned corrections
-    const correctedChunks = await applyCorrections(chunksToUse);
-
-    // Check if we should request clarification for client-specific queries with many results
+    // Check for clarification request
     if (searchFilters.client && shouldRequestClarification(correctedChunks, query)) {
       const clarificationResponse = generateClarificationResponse(correctedChunks, searchFilters.client);
       return NextResponse.json({
         answer: clarificationResponse,
         sources: [],
-        context: {
-          lastClient: explicitClient || searchFilters.client, // Only keep client if explicitly mentioned
-          lastQuery: query
-        },
+        context: enhancedContext,
         appliedFilters,
         suggestions: [],
-        // For feedback system - even clarification requests need feedback
-        chunk_ids: correctedChunks.slice(0, 10).map(chunk => chunk.id), // Include some chunk IDs for context
+        chunk_ids: correctedChunks.slice(0, 10).map(chunk => chunk.id),
         query_type: detectConsultantQueryType(query)
       });
     }
 
-    // Detect duplicates in results
+    // Generate answer
     const duplicateWarnings = detectDuplicates(correctedChunks);
-
-    // Generate enhanced answer with context awareness
     let contextualPrompt = '';
     if (searchFilters.client) {
       contextualPrompt = `Focus specifically on work done for ${searchFilters.client}. `;
@@ -982,66 +1086,83 @@ export async function POST(request: NextRequest) {
       contextualPrompt += 'Present the information in chronological order by project date. ';
     }
 
-    // Detect format preferences from the query
     const formatInstructions = extractFormatInstructions(query);
-    
-    // Determine how many chunks to use based on query type
     const isMethodologyQuery = /how (do )?(we|you) (typically|usually|normally|approach|handle|conduct|structure)/i.test(query) ||
                               /what is (our|your) (typical|usual|standard|normal) approach/i.test(query) ||
                               /what is (our|your) methodology/i.test(query) ||
                               /best practices/i.test(query) ||
                               /how (do|should) (we|you) approach/i.test(query);
     
-    // Use more chunks for methodology synthesis, fewer for specific queries
-    const chunksForAnswer = isMethodologyQuery ? 
-      correctedChunks.slice(0, 15) : // More data for methodology synthesis
-      correctedChunks.slice(0, 5);   // Standard amount for other queries
-    
-    console.log(`Using ${chunksForAnswer.length} chunks for answer generation (methodology: ${isMethodologyQuery})`);
-    
-    // Extract chunk IDs for feedback system
+    const chunksForAnswer = isMethodologyQuery ? correctedChunks.slice(0, 15) : correctedChunks.slice(0, 5);
     const usedChunkIds = chunksForAnswer.map(chunk => chunk.id);
-    
-    // Detect query type for feedback system
     const queryType = detectConsultantQueryType(query);
     
-    const answer = await answerQuestion(
-      contextualPrompt + query, 
-      chunksForAnswer,
-      formatInstructions
-    );
-    console.log('Generated answer length:', answer.length);
-
-    // Format response based on query type
+    const answer = await answerQuestion(contextualPrompt + query, chunksForAnswer, formatInstructions);
     const formattedResponse = formatResponseForQuery(query, correctedChunks, answer);
 
-    // Generate proactive suggestions
-    const suggestions = generateProactiveFollowups(query, context || {}, correctedChunks);
+    // Extract entities from the response for context tracking
+    const responseEntities = extractEntitiesFromResponse(formattedResponse.answer, correctedChunks);
+    const extractedProject = extractProjectNameFromResponse(formattedResponse.answer);
 
-    const responseContext = {
-      lastClient: explicitClient || searchFilters.client, // Only keep client if explicitly mentioned
-      lastQuery: query,
-      lastSector: correctedChunks[0]?.sector,
+    // Build enhanced response context
+    const conversationEntry = {
+      query,
+      response: formattedResponse.answer,
+      entities: responseEntities,
+      queryType,
+      resultChunks: usedChunkIds,
+      timestamp: new Date()
+    };
+
+    const updatedContext: ConversationContext = {
+      conversationHistory: [
+        ...(enhancedContext.conversationHistory || []),
+        conversationEntry
+      ].slice(-10), // Keep last 10 turns
+      activeEntities: {
+        currentClient: explicitClient || searchFilters.client || enhancedContext.activeEntities?.currentClient,
+        currentProject: extractedProject || enhancedContext.activeEntities?.currentProject,
+        currentSector: correctedChunks[0]?.sector || enhancedContext.activeEntities?.currentSector,
+                 discussedClients: [
+           ...(enhancedContext.activeEntities?.discussedClients || []),
+           explicitClient || searchFilters.client
+         ].filter((client): client is string => Boolean(client)).slice(-5),
+         discussedProjects: [
+           ...(enhancedContext.activeEntities?.discussedProjects || []),
+           extractedProject
+         ].filter((project): project is string => Boolean(project)).slice(-5)
+      },
+      conversationTurn: enhancedContext.conversationTurn,
       lastSuccessfulResults: correctedChunks.length > 0 ? correctedChunks.slice(0, 10).map(chunk => ({
         id: chunk.id,
         filename: chunk.filename,
         client: chunk.client || chunk.metadata?.client,
         content: chunk.content
-      })) : undefined
+      })) : enhancedContext.lastSuccessfulResults,
+      // Legacy fields
+      lastClient: explicitClient || searchFilters.client,
+      lastQuery: query,
+      lastSector: correctedChunks[0]?.sector
     };
 
-    console.log('=== RESPONSE CONTEXT BEING SENT ===');
-    console.log('Response context:', JSON.stringify(responseContext, null, 2));
+    // Generate suggestions using enhanced context
+    const suggestions = generateProactiveFollowups(query, updatedContext, correctedChunks);
 
     const response: AskResponse = {
       ...formattedResponse,
-      context: responseContext,
+      context: updatedContext,
       appliedFilters,
       suggestions,
       duplicateWarnings: duplicateWarnings.length > 0 ? duplicateWarnings : undefined,
-      // For feedback system
       chunk_ids: usedChunkIds,
-      query_type: queryType
+      query_type: queryType,
+      searchMetadata: {
+        queryExpansion: searchResult?.searchMetadata?.queryExpansion,
+        stageResults: searchResult?.searchMetadata?.stageResults,
+        processingTime: searchResult?.searchMetadata?.processingTime,
+        searchStrategy: searchFilters.client ? 'client-specific' : 
+                       isMethodologyQuery ? 'methodology' : 'enhanced-semantic'
+      }
     };
 
     console.log('=== ASK API SUCCESS ===');
